@@ -6,8 +6,8 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/sagernet/sing/common/control"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/control"
 	"github.com/xtls/xray-core/transport/internet"
 )
 

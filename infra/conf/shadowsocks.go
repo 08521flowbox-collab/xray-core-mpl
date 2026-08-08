@@ -3,15 +3,32 @@ package conf
 import (
 	"strings"
 
-	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
-	C "github.com/sagernet/sing/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
-	"github.com/xtls/xray-core/proxy/shadowsocks_2022"
 	"google.golang.org/protobuf/proto"
 )
+
+// shadowsocks2022Methods mirrors shadowaead_2022.List from
+// github.com/sagernet/sing-shadowsocks (GPL-3.0-or-later). This fork drops
+// that dependency and the shadowsocks_2022 proxy along with it; the names are
+// kept only so a config that asks for them gets a clear error instead of being
+// silently parsed as a legacy Shadowsocks cipher.
+var shadowsocks2022Methods = []string{
+	"2022-blake3-aes-128-gcm",
+	"2022-blake3-aes-256-gcm",
+	"2022-blake3-chacha20-poly1305",
+}
+
+func isShadowsocks2022Method(c string) bool {
+	for _, m := range shadowsocks2022Methods {
+		if m == c {
+			return true
+		}
+	}
+	return false
+}
 
 func cipherFromString(c string) shadowsocks.CipherType {
 	switch strings.ToLower(c) {
@@ -51,8 +68,8 @@ type ShadowsocksServerConfig struct {
 func (v *ShadowsocksServerConfig) Build() (proto.Message, error) {
 	errors.PrintNonRemovalDeprecatedFeatureWarning("Shadowsocks (with no Forward Secrecy, etc.)", "VLESS Encryption")
 
-	if C.Contains(shadowaead_2022.List, v.Cipher) {
-		return buildShadowsocks2022(v)
+	if isShadowsocks2022Method(v.Cipher) {
+		return nil, errors.New("Shadowsocks 2022 is not supported in this build")
 	}
 
 	config := new(shadowsocks.ServerConfig)
@@ -95,66 +112,6 @@ func (v *ShadowsocksServerConfig) Build() (proto.Message, error) {
 		})
 	}
 
-	return config, nil
-}
-
-func buildShadowsocks2022(v *ShadowsocksServerConfig) (proto.Message, error) {
-	if len(v.Users) == 0 {
-		config := new(shadowsocks_2022.ServerConfig)
-		config.Method = v.Cipher
-		config.Key = v.Password
-		config.Network = v.NetworkList.Build()
-		config.Email = v.Email
-		return config, nil
-	}
-
-	if v.Cipher == "" {
-		return nil, errors.New("shadowsocks 2022 (multi-user): missing server method")
-	}
-	if !strings.Contains(v.Cipher, "aes") {
-		return nil, errors.New("shadowsocks 2022 (multi-user): only blake3-aes-*-gcm methods are supported")
-	}
-
-	if v.Users[0].Address == nil {
-		config := new(shadowsocks_2022.MultiUserServerConfig)
-		config.Method = v.Cipher
-		config.Key = v.Password
-		config.Network = v.NetworkList.Build()
-
-		for _, user := range v.Users {
-			if user.Cipher != "" {
-				return nil, errors.New("shadowsocks 2022 (multi-user): users must have empty method")
-			}
-			account := &shadowsocks_2022.Account{
-				Key: user.Password,
-			}
-			config.Users = append(config.Users, &protocol.User{
-				Email:   user.Email,
-				Level:   uint32(user.Level),
-				Account: serial.ToTypedMessage(account),
-			})
-		}
-		return config, nil
-	}
-
-	config := new(shadowsocks_2022.RelayServerConfig)
-	config.Method = v.Cipher
-	config.Key = v.Password
-	config.Network = v.NetworkList.Build()
-	for _, user := range v.Users {
-		if user.Cipher != "" {
-			return nil, errors.New("shadowsocks 2022 (relay): users must have empty method")
-		}
-		if user.Address == nil {
-			return nil, errors.New("shadowsocks 2022 (relay): all users must have relay address")
-		}
-		config.Destinations = append(config.Destinations, &shadowsocks_2022.RelayDestination{
-			Key:     user.Password,
-			Email:   user.Email,
-			Address: user.Address.Build(),
-			Port:    uint32(user.Port),
-		})
-	}
 	return config, nil
 }
 
@@ -204,32 +161,15 @@ func (v *ShadowsocksClientConfig) Build() (proto.Message, error) {
 
 	if len(v.Servers) == 1 {
 		server := v.Servers[0]
-		if C.Contains(shadowaead_2022.List, server.Cipher) {
-			if server.Address == nil {
-				return nil, errors.New("Shadowsocks server address is not set.")
-			}
-			if server.Port == 0 {
-				return nil, errors.New("Invalid Shadowsocks port.")
-			}
-			if server.Password == "" {
-				return nil, errors.New("Shadowsocks password is not specified.")
-			}
-
-			config := new(shadowsocks_2022.ClientConfig)
-			config.Address = server.Address.Build()
-			config.Port = uint32(server.Port)
-			config.Method = server.Cipher
-			config.Key = server.Password
-			config.UdpOverTcp = server.UoT
-			config.UdpOverTcpVersion = uint32(server.UoTVersion)
-			return config, nil
+		if isShadowsocks2022Method(server.Cipher) {
+			return nil, errors.New("Shadowsocks 2022 is not supported in this build")
 		}
 	}
 
 	config := new(shadowsocks.ClientConfig)
 	for _, server := range v.Servers {
-		if C.Contains(shadowaead_2022.List, server.Cipher) {
-			return nil, errors.New("Shadowsocks 2022 accept no multi servers")
+		if isShadowsocks2022Method(server.Cipher) {
+			return nil, errors.New("Shadowsocks 2022 is not supported in this build")
 		}
 		if server.Address == nil {
 			return nil, errors.New("Shadowsocks server address is not set.")

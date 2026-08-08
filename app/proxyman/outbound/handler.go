@@ -6,7 +6,6 @@ import (
 	goerrors "errors"
 	"io"
 	"math/big"
-	"os"
 
 	"github.com/xtls/xray-core/common/dice"
 
@@ -309,9 +308,10 @@ func (h *Handler) Dial(ctx context.Context, dest net.Destination) (stat.Connecti
 
 	}
 
-	if conn, err := h.getUoTConnection(ctx, dest); err != os.ErrInvalid {
-		return conn, err
-	}
+	// Upstream Xray-core tries a UDP-over-TCP connection here via
+	// github.com/sagernet/sing (GPL-3.0-or-later). UoT is a Shadowsocks-2022
+	// feature and this fork ships neither, so the call is removed along with
+	// the dependency.
 
 	conn, err := internet.Dial(ctx, dest, h.streamSettings)
 	conn = h.getStatCouterConnection(conn)
