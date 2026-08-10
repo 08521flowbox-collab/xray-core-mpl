@@ -51,6 +51,35 @@ proxy is dropped rather than patched.
 Note that `transport/internet/finalmask/header/wireguard` is a different, unrelated package
 (a packet header obfuscator) and is untouched.
 
+## Fixing the tun inbound's teardown
+
+Not a licence change, and the only change here that alters behaviour. Upstream never closes
+`proxy/tun`, so the interface it attached to stays referenced after the instance that owns
+it is gone.
+
+The path that should reach it does not exist: `proxy/tun.Handler.Network()` returns an empty
+list because the tun is not a listener, so `NewAlwaysOnInboundHandler` builds no worker for
+it — and a worker is the only caller of `common.Close` on a proxy. `Handler` also had no
+`Close` method, so even when reached it would have been a no-op through `common.Close`'s
+`Closable` type check. Both halves had to change.
+
+| File | Change |
+|---|---|
+| `proxy/tun/handler.go` | **New `Close() error`**, implementing `common.Closable`: closes the stack, then the tun. The stack goes first because its `Close` reaches gVisor's `endpoint.Attach(nil)`, which stops the packet dispatchers and waits for their goroutines to leave `dispatchLoop`; releasing the tun before them would leave them reading a descriptor already let go. Idempotent under a mutex — teardown has several entrances, and a failed `Init` closes what it built. `Init` now keeps the `Tun` it creates, which it previously dropped on the floor. |
+| `app/proxyman/inbound/always.go` | `Close` now calls `common.Close(h.proxy)` **when the handler has no workers**. Guarded on the count so an inbound that does have workers keeps closing its proxy exactly once, by the pre-existing path. |
+
+Why it matters on the consumer's platform: gVisor's `fdbased` dispatchers sit in `poll()` on
+the descriptor, so the kernel holds a reference to the tun file and the descriptor's owner
+closing it does not bring the interface down. On Android, `system_server` tears down the VPN
+network — and the status bar key icon with it — from `Vpn.interfaceRemoved`, which never
+fires while the interface is still referenced. Measured before this change: the interface
+outlived the disconnect by 4.7 s, by over 25 s, and once by 31 s, the wait being however long
+it took for some packet to wake the poll. Every disconnect also leaked the whole stack — NIC,
+endpoint and forwarder goroutines.
+
+Neither `fdbased.endpoint.Close()` nor `AndroidTun.Close()` is a fallback: both are empty
+implementations upstream.
+
 ## Verifying the result
 
 ```sh

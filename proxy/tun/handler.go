@@ -2,6 +2,7 @@ package tun
 
 import (
 	"context"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -22,6 +23,8 @@ import (
 type Handler struct {
 	ctx             context.Context
 	config          *Config
+	closeOnce       sync.Mutex
+	tun             Tun
 	stack           Stack
 	policyManager   policy.Manager
 	dispatcher      routing.Dispatcher
@@ -36,6 +39,9 @@ type ConnectionHandler interface {
 
 // Handler implements ConnectionHandler
 var _ ConnectionHandler = (*Handler)(nil)
+
+// Handler implements common.Closable
+var _ common.Closable = (*Handler)(nil)
 
 func (t *Handler) policy() policy.Session {
 	p := t.policyManager.ForLevel(t.config.UserLevel)
@@ -95,8 +101,50 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 	}
 
 	t.stack = tunStack
+	t.tun = tunInterface
 
 	errors.LogInfo(t.ctx, tunName, " up")
+	return nil
+}
+
+// Close implements common.Closable, and it is what lets the tun descriptor go.
+//
+// Without it the stack built in Init outlives the instance that owns it. Nothing
+// else reaches this handler on the way down: it has no listening port, so
+// AlwaysOnInboundHandler builds no worker for it, and a worker is what calls
+// common.Close on a proxy. The stack's own Close is therefore the only path to
+// the gVisor endpoint's Attach(nil) — the one call that stops the dispatchers
+// and waits for their goroutines to leave dispatchLoop.
+//
+// On Android that is not a tidiness question. Those goroutines sit in poll() on
+// the descriptor VpnService.Builder established, so the kernel holds a reference
+// to the tun file and closing the descriptor on the Java side does not bring the
+// interface down. system_server tears the VPN network — and the status bar key
+// icon with it — from Vpn.interfaceRemoved, which never fires while the
+// interface is still referenced. Measured before this existed: the interface
+// outlived the disconnect by 4.7 s, by over 25 s, and once by 31 s, the wait
+// being however long it took for some packet to wake the poll.
+func (t *Handler) Close() error {
+	// Reachable more than once: teardown has several entrances and a failed
+	// Init closes what it managed to build.
+	t.closeOnce.Lock()
+	defer t.closeOnce.Unlock()
+
+	var errs []error
+	// The stack first. It is what is reading the descriptor, and its Close
+	// blocks until the readers are gone; releasing the tun before them would
+	// leave them reading a descriptor that had already been let go.
+	if t.stack != nil {
+		errs = append(errs, t.stack.Close())
+		t.stack = nil
+	}
+	if t.tun != nil {
+		errs = append(errs, t.tun.Close())
+		t.tun = nil
+	}
+	if err := errors.Combine(errs...); err != nil {
+		return errors.New("failed to close tun handler").Base(err)
+	}
 	return nil
 }
 

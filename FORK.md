@@ -27,13 +27,14 @@ Removing both is the entire purpose of this fork. There are no feature additions
 
 See **[`MODIFICATIONS.md`](./MODIFICATIONS.md)** for the file-by-file list.
 
-The history is deliberately split so the two kinds of change can be reviewed
+The history is deliberately split so the kinds of change can be reviewed
 separately:
 
 | Commit | |
 |---|---|
 | `剥离 GPL 传递依赖：去掉 sagernet/sing 与 sing-shadowsocks` | the licence work — everything MPL-2.0 requires to be published |
 | `为 APK 体积裁掉两块用不上的东西：DNS-over-QUIC 与 gRPC 传输凭据` | optional size trimming for the Android consumer |
+| `tun inbound 从来没有被关过：补 Handler.Close 与到得了它的那条路` | the one behaviour fix — upstream leaks the tun stack on every teardown |
 
 To see the whole diff against the upstream release this is based on:
 

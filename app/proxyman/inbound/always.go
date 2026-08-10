@@ -185,6 +185,17 @@ func (h *AlwaysOnInboundHandler) Close() error {
 	for _, worker := range h.workers {
 		errs = append(errs, worker.Close())
 	}
+	// A proxy that listens on nothing gets no worker above, and a worker is
+	// the only thing that calls common.Close on a proxy. So an inbound whose
+	// Network() is empty — proxy/tun is the one that exists — was never being
+	// closed at all: its resources outlived the instance that owned them.
+	//
+	// Guarded on the count rather than called unconditionally, so an inbound
+	// that does have workers keeps closing its proxy exactly once, through the
+	// same path as before this.
+	if len(h.workers) == 0 {
+		errs = append(errs, common.Close(h.proxy))
+	}
 	errs = append(errs, h.mux.Close())
 	if err := errors.Combine(errs...); err != nil {
 		return errors.New("failed to close all resources").Base(err)
