@@ -131,6 +131,32 @@ keeps the live one, because an appended config carries the zero value (`AsIs`) w
 its author meant to say anything about the strategy. `TestReloadUpdatesDomainStrategy` and
 `TestAppendingRulesKeepsTheStrategy`.
 
+## Letting the test suite run without the geodata downloads
+
+Not a licence change, and not a behaviour change either — this one is only about the tests
+being runnable.
+
+| File | Change |
+|---|---|
+| `app/router/condition_geoip_test.go` | `getAssetPath` now wraps a sentinel `errNoAsset` when the file is simply absent. New helper `mustHaveAsset(tb, err)` skips on that sentinel and `common.Must`s anything else. Applied to `TestGeoIPMatcher4CN`, `TestGeoIPMatcher6US` and the two benchmarks beside them. |
+| `app/router/condition_test.go` | Same helper applied to `TestChinaSites`, `BenchmarkMphDomainMatcher` and `BenchmarkMultiGeoIPMatcher`. |
+| `infra/conf/router_test.go` | Its own copy of `getAssetPath` gets the same sentinel; `TestToCidrList` skips on it. |
+
+`geoip.dat` and `geosite.dat` are about 10 MB together, are built by a separate release
+workflow, and are in neither upstream's repository nor this fork's. Upstream's CI downloads them
+before running tests, so upstream never meets the failure. A plain `go test ./...` on a fresh
+clone does: `loadGeoIP` returned an error, the callers passed it to `common.Must`, and the
+resulting **panic took down the entire `app/router` test binary** — so the price of not having a
+10 MB download was that every other test in the package, including the three added above for the
+copy-on-write change, reported nothing at all.
+
+The distinction the sentinel draws is the whole point. **Absent** is a skip: the machine does not
+have an optional download. **Present but unreadable, or corrupt, or missing the country asked
+for** still fails loudly, exactly as before — a dat file that parses wrong is a real defect and
+must not be quiet. Both states are exercised: with `XRAY_LOCATION_ASSET` pointed at a directory
+holding the two files, all four tests run and pass; without it, they skip and the rest of the
+package runs.
+
 ## Verifying the result
 
 ```sh

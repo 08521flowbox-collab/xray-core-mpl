@@ -1,6 +1,7 @@
 package router_test
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,24 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// errNoAsset separates "the dat file is not on this machine" from every other
+// way loading it can fail. Only the former is a skip: geoip.dat and
+// geosite.dat are downloaded by the release workflow and are not in the
+// repository, so a plain `go test ./...` on a fresh clone has neither.
+var errNoAsset = errors.New("geodata asset not present")
+
+// mustHaveAsset skips instead of failing when the only thing missing is the
+// dat file itself. A corrupt or unreadable one still fails loudly — the point
+// is to stop an absent 10 MB download from panicking the whole package and
+// taking every other test in it down, not to make geodata failures quiet.
+func mustHaveAsset(tb testing.TB, err error) {
+	tb.Helper()
+	if errors.Is(err, errNoAsset) {
+		tb.Skip(err.Error())
+	}
+	common.Must(err)
+}
+
 func getAssetPath(file string) (string, error) {
 	path := platform.GetAssetLocation(file)
 	_, err := os.Stat(path)
@@ -21,7 +40,7 @@ func getAssetPath(file string) (string, error) {
 		path := filepath.Join("..", "..", "resources", file)
 		_, err := os.Stat(path)
 		if os.IsNotExist(err) {
-			return "", fmt.Errorf("can't find %s in standard asset locations or {project_root}/resources", file)
+			return "", fmt.Errorf("can't find %s in standard asset locations or {project_root}/resources: %w", file, errNoAsset)
 		}
 		if err != nil {
 			return "", fmt.Errorf("can't stat %s: %v", path, err)
@@ -183,7 +202,7 @@ func TestGeoIPReverseMatcher(t *testing.T) {
 
 func TestGeoIPMatcher4CN(t *testing.T) {
 	ips, err := loadGeoIP("CN")
-	common.Must(err)
+	mustHaveAsset(t, err)
 
 	matcher, err := router.BuildOptimizedGeoIPMatcher(&router.GeoIP{
 		Cidr: ips,
@@ -197,7 +216,7 @@ func TestGeoIPMatcher4CN(t *testing.T) {
 
 func TestGeoIPMatcher6US(t *testing.T) {
 	ips, err := loadGeoIP("US")
-	common.Must(err)
+	mustHaveAsset(t, err)
 
 	matcher, err := router.BuildOptimizedGeoIPMatcher(&router.GeoIP{
 		Cidr: ips,
@@ -235,7 +254,7 @@ func loadGeoIP(country string) ([]*router.CIDR, error) {
 
 func BenchmarkGeoIPMatcher4CN(b *testing.B) {
 	ips, err := loadGeoIP("CN")
-	common.Must(err)
+	mustHaveAsset(b, err)
 
 	matcher, err := router.BuildOptimizedGeoIPMatcher(&router.GeoIP{
 		Cidr: ips,
@@ -251,7 +270,7 @@ func BenchmarkGeoIPMatcher4CN(b *testing.B) {
 
 func BenchmarkGeoIPMatcher6US(b *testing.B) {
 	ips, err := loadGeoIP("US")
-	common.Must(err)
+	mustHaveAsset(b, err)
 
 	matcher, err := router.BuildOptimizedGeoIPMatcher(&router.GeoIP{
 		Cidr: ips,

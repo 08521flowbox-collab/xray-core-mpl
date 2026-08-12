@@ -2,6 +2,7 @@ package conf_test
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,6 +20,11 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// errNoAsset separates "the dat file is not on this machine" from every other
+// way loading it can fail — see the copy in app/router for why only the former
+// is a skip. Duplicated because the two live in different test packages.
+var errNoAsset = errors.New("geodata asset not present")
+
 func getAssetPath(file string) (string, error) {
 	path := platform.GetAssetLocation(file)
 	_, err := os.Stat(path)
@@ -26,7 +32,7 @@ func getAssetPath(file string) (string, error) {
 		path := filepath.Join("..", "..", "resources", file)
 		_, err := os.Stat(path)
 		if os.IsNotExist(err) {
-			return "", fmt.Errorf("can't find %s in standard asset locations or {project_root}/resources", file)
+			return "", fmt.Errorf("can't find %s in standard asset locations or {project_root}/resources: %w", file, errNoAsset)
 		}
 		if err != nil {
 			return "", fmt.Errorf("can't stat %s: %v", path, err)
@@ -48,6 +54,9 @@ func TestToCidrList(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 
 	geoipPath, err := getAssetPath("geoip.dat")
+	if errors.Is(err, errNoAsset) {
+		t.Skip(err.Error())
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

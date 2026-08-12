@@ -326,7 +326,7 @@ func loadGeoSite(country string) ([]*Domain, error) {
 
 func TestChinaSites(t *testing.T) {
 	domains, err := loadGeoSite("CN")
-	common.Must(err)
+	mustHaveAsset(t, err)
 
 	acMatcher, err := NewMphMatcherGroup(domains)
 	common.Must(err)
@@ -368,7 +368,7 @@ func TestChinaSites(t *testing.T) {
 
 func BenchmarkMphDomainMatcher(b *testing.B) {
 	domains, err := loadGeoSite("CN")
-	common.Must(err)
+	mustHaveAsset(b, err)
 
 	matcher, err := NewMphMatcherGroup(domains)
 	common.Must(err)
@@ -413,7 +413,7 @@ func BenchmarkMultiGeoIPMatcher(b *testing.B) {
 
 	{
 		ips, err := loadGeoIP("CN")
-		common.Must(err)
+		mustHaveAsset(b, err)
 		geoips = append(geoips, &GeoIP{
 			CountryCode: "CN",
 			Cidr:        ips,
@@ -422,7 +422,7 @@ func BenchmarkMultiGeoIPMatcher(b *testing.B) {
 
 	{
 		ips, err := loadGeoIP("JP")
-		common.Must(err)
+		mustHaveAsset(b, err)
 		geoips = append(geoips, &GeoIP{
 			CountryCode: "JP",
 			Cidr:        ips,
@@ -431,7 +431,7 @@ func BenchmarkMultiGeoIPMatcher(b *testing.B) {
 
 	{
 		ips, err := loadGeoIP("CA")
-		common.Must(err)
+		mustHaveAsset(b, err)
 		geoips = append(geoips, &GeoIP{
 			CountryCode: "CA",
 			Cidr:        ips,
@@ -440,7 +440,7 @@ func BenchmarkMultiGeoIPMatcher(b *testing.B) {
 
 	{
 		ips, err := loadGeoIP("US")
-		common.Must(err)
+		mustHaveAsset(b, err)
 		geoips = append(geoips, &GeoIP{
 			CountryCode: "US",
 			Cidr:        ips,
