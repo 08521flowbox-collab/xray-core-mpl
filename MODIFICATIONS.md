@@ -181,6 +181,25 @@ The `Atoi` half is smaller and in the same line of reasoning: `platform.NewEnvFl
 back to `"0"`, and `SetNonblock(0, true)` *succeeds* — on stdin. Returning the error means the
 tunnel fails to start instead of attaching the stack to the wrong file.
 
+## Failing the dial when the socket could not be protected
+
+Not a licence change. Behaviour, and deliberately fail-closed.
+
+| File | Change |
+|---|---|
+| `transport/internet/system_dialer.go` | Both controller loops (the UDP `ListenConfig.Control` and the TCP `Dialer.Control`) now `return err` when a registered controller fails, instead of logging it and dialling anyway. |
+
+The only controller the consumer registers is the one that hands the socket to Android's
+`VpnService.protect()`. Upstream's behaviour — `errors.LogInfoInner` and carry on — produces a
+working connection that was never protected, and says so nowhere any application can see.
+
+What that costs depends on the consumer, and for this one it is *not* a routing loop: the app is
+excluded from its own tunnel at UID level, so an unprotected socket dials out directly, which is
+what protect was arranging anyway. What protect actually is here is depth — the line that still
+holds when an OEM's UID rules do not, or when somebody later adds the app to its own allow-list.
+A line that fails open is not a line. A failed dial, by contrast, is a state the tunnel already
+knows how to report.
+
 ## Verifying the result
 
 ```sh

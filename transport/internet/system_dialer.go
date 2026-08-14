@@ -66,7 +66,13 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		lc.Control = func(network, address string, c syscall.RawConn) error {
 			for _, ctl := range d.controllers {
 				if err := ctl(network, address, c); err != nil {
+					// Fail closed. On Android the only registered controller is the
+					// one that hands the socket to VpnService.protect(); logging and
+					// dialling anyway produces a socket that was never protected and
+					// says so nowhere the app can see. A failed dial is a state the
+					// tunnel already knows how to report.
 					errors.LogInfoInner(ctx, err, "failed to apply external controller")
+					return err
 				}
 			}
 			return c.Control(func(fd uintptr) {
@@ -123,7 +129,9 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		dialer.Control = func(network, address string, c syscall.RawConn) error {
 			for _, ctl := range d.controllers {
 				if err := ctl(network, address, c); err != nil {
+					// Fail closed — same reasoning as the UDP path above.
 					errors.LogInfoInner(ctx, err, "failed to apply external controller")
+					return err
 				}
 			}
 			return c.Control(func(fd uintptr) {
