@@ -157,6 +157,30 @@ must not be quiet. Both states are exercised: with `XRAY_LOCATION_ASSET` pointed
 holding the two files, all four tests run and pass; without it, they skip and the rest of the
 package runs.
 
+## Not handing the consumer's descriptor back to the kernel
+
+Not a licence change. One line, and it broke a contract the consumer's whole ownership model
+rests on.
+
+| File | Change |
+|---|---|
+| `proxy/tun/tun_android.go` | `NewTun` no longer calls `unix.Close(fd)` when `SetNonblock` fails; it returns the error and leaves the descriptor alone. It also stops ignoring `strconv.Atoi`'s error, which previously fell back to fd 0. |
+
+The descriptor belongs to the caller. `libzapcore`'s package comment states the contract the
+Kotlin side is built on — "only marks the fd non-blocking, **it does not dup it**, and
+`AndroidTun.Close` is empty" — and `VpnService.Builder.establish()` is what produced it, so its
+lifetime is the Android side's to manage. Closing it here handed its *number* back to the
+process while the owner still believed it held it: the next socket anything opened could take
+that number, and gVisor would then read and write somebody's HTTPS connection as if it were the
+tunnel. A native tombstone with no Java frame in it.
+
+`SetNonblock` does not fail on an ordinary device. It fails under a stricter SELinux policy on a
+custom ROM, which is exactly the population that cannot report the crash usefully.
+
+The `Atoi` half is smaller and in the same line of reasoning: `platform.NewEnvFlag(...)` falls
+back to `"0"`, and `SetNonblock(0, true)` *succeeds* — on stdin. Returning the error means the
+tunnel fails to start instead of attaching the stack to the wrong file.
+
 ## Verifying the result
 
 ```sh
