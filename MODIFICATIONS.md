@@ -200,6 +200,31 @@ holds when an OEM's UID rules do not, or when somebody later adds the app to its
 A line that fails open is not a line. A failed dial, by contrast, is a state the tunnel already
 knows how to report.
 
+## Surviving teardown while connections are still in flight (FakeDNS)
+
+Not a licence change. A cherry-pick of upstream `7ab0a3ccb7` ("FakeDNS: Little fix", 2026-05-01),
+which landed five weeks after the version this fork pins.
+
+| File | Change |
+|---|---|
+| `app/dns/fakedns/fake.go` | `Holder.Close` no longer nils `domainToIP`, `ipRange` and `mu`; `mu` becomes a value mutex so it cannot be nil; the rest of the upstream commit is taken verbatim. `fake_close_test.go` (ours, not upstream's) pins the property. |
+
+`Holder.Close` used to tear the fields out from under every reader. The readers are hot paths —
+`IsIPInIPPool` answers the sniffer's `fakedns` destination override on every connection,
+`GetDomainFromFakeDNS` maps a sniffed fake address back to its name, `GetFakeIPForDomain` answers
+every A query — and none of them checked. Instance teardown does not drain connections, so a
+stop with traffic in flight was one nil dereference away from ending the process: a panic on a
+core goroutine is not recoverable by anyone (the consumer's `guard` only covers its own entry
+points), so the runtime aborts.
+
+Measured, not theoretical: this is the crash behind three tombstones on the consumer's side —
+`SIGSEGV addr=0x0` inside `net.(*IPNet).Contains`, re-raised as SIGABRT with the pc parked on
+`runtime.raise`'s post-`tgkill` instruction. It fired deterministically the moment geo rules
+were enabled, because `IpIfNonMatch` makes the router resolve every unmatched connection: the
+probe slows, the connect path retries, and the retry's stop lands while the tunnel is at its
+busiest. Nil-ing the fields freed nothing anyway — the Holder is unreachable once the instance
+is gone, and the GC takes it whole.
+
 ## Verifying the result
 
 ```sh
