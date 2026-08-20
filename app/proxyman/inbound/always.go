@@ -171,6 +171,16 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 
 // Start implements common.Runnable.
 func (h *AlwaysOnInboundHandler) Start() error {
+	// An inbound that listens on nothing gets no worker below, and a worker is
+	// what would otherwise start its proxy. proxy/tun is the one that exists,
+	// and it used to bring the interface up in Init — before the features had
+	// been started, which is how a packet reached a FakeDNS holder that had not
+	// been initialised yet. See proxy/tun.Handler.Start.
+	if run, ok := h.proxy.(common.Runnable); ok {
+		if err := run.Start(); err != nil {
+			return errors.New("failed to start proxy").Base(err)
+		}
+	}
 	for _, worker := range h.workers {
 		if err := worker.Start(); err != nil {
 			return err

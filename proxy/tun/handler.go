@@ -43,15 +43,25 @@ var _ ConnectionHandler = (*Handler)(nil)
 // Handler implements common.Closable
 var _ common.Closable = (*Handler)(nil)
 
+// Handler implements common.Runnable
+var _ common.Runnable = (*Handler)(nil)
+
 func (t *Handler) policy() policy.Session {
 	p := t.policyManager.ForLevel(t.config.UserLevel)
 	return p
 }
 
-// Init the Handler instance with necessary parameters
+// Init the Handler instance with necessary parameters.
+//
+// **It no longer brings the interface up**, and that is the whole of this
+// split. Init runs while the instance is still being assembled, before the
+// features have been started — and a tun that is already reading is already
+// dispatching, so the first packet reached a FakeDNS holder whose ipRange had
+// not been assigned yet and took the process down in
+// `net.(*IPNet).Contains`. Upstream #6442 reports exactly that and was closed
+// with "这是TUN入站启动过早的问题 已经修复TUN入站": the fix is the ordering,
+// not a nil guard on the holder. See [Handler.Start] and MODIFICATIONS.md.
 func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routing.Dispatcher) error {
-	var err error
-
 	// Retrieve tag and sniffing config from context (set by AlwaysOnInboundHandler)
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		t.tag = inbound.Tag
@@ -64,6 +74,17 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 	t.policyManager = pm
 	t.dispatcher = dispatcher
 
+	return nil
+}
+
+// Start implements common.Runnable, and it is where the interface comes up.
+//
+// Reached from AlwaysOnInboundHandler.Start, which runs after core.Start has
+// started every feature. A tun inbound has no listening port and therefore no
+// worker, and a worker is what would otherwise have started it — which is why
+// the call there is guarded on common.Runnable rather than being one more
+// worker loop.
+func (t *Handler) Start() error {
 	tunName := t.config.Name
 	tunOptions := TunOptions{
 		Name: tunName,
@@ -78,7 +99,7 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 
 	tunStackOptions := StackOptions{
 		Tun:         tunInterface,
-		IdleTimeout: pm.ForLevel(t.config.UserLevel).Timeouts.ConnectionIdle,
+		IdleTimeout: t.policyManager.ForLevel(t.config.UserLevel).Timeouts.ConnectionIdle,
 	}
 	tunStack, err := NewStack(t.ctx, tunStackOptions, t)
 	if err != nil {

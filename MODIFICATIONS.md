@@ -225,6 +225,40 @@ probe slows, the connect path retries, and the retry's stop lands while the tunn
 busiest. Nil-ing the fields freed nothing anyway — the Holder is unreachable once the instance
 is gone, and the GC takes it whole.
 
+## Starting the tun inbound after the features (FakeDNS, the other end)
+
+Not a licence change. A cherry-pick of upstream `06b4931743` (PR #6275, "TUN inbound: Start TUN
+by AlwaysOnInboundHandler", 2026-06-09), which landed ten weeks after the version this fork pins
+and ships from upstream v26.6.22.
+
+| File | Change |
+|---|---|
+| `proxy/tun/handler.go` | `Init` keeps only the context, tag, sniffing request, policy manager and dispatcher. Creating the tun, building the stack and starting both move to a new `Start`, and `Handler` now declares `common.Runnable`. The stack options read `t.policyManager` rather than the `pm` parameter that no longer reaches them. |
+| `app/proxyman/inbound/always.go` | `Start` starts the proxy itself when it implements `common.Runnable`, before the workers. |
+| `proxy/tun/handler_start_test.go` | Ours, not upstream's. Pins that `Init` leaves `tun` and `stack` nil. |
+
+`Close` is *not* taken from upstream: this fork already made it nil-safe and ordered (see
+"Fixing the tun inbound's teardown"), which is what upstream's `common.CloseIfExists` achieves
+there.
+
+The same crash signature as the section above — `SIGSEGV addr=0x0` inside
+`net.(*IPNet).Contains`, reached through `fakedns.(*Holder).GetDomainFromFakeDNS` — but from the
+opposite end of the holder's life. `Close` no longer nils the fields; **`Start` had not yet
+filled them**. `NewFakeDNSHolderConfigOnly` builds a holder whose `ipRange` is nil and leaves it
+that way until the feature's own `Start` runs, while `Init` brought the interface up and began
+dispatching. The first packet through the tun was sniffed against a holder that had no pool yet.
+
+Measured on the consumer's Android e2e suite, 2026-08-20: the core logged `starting with {...}`
+and panicked **73 ms later**, on the gVisor stack's own goroutine
+(`proxy/tun.(*stackGVisor).Start.func1.1`), taking the VPN service down with it. One occurrence
+in eight tunnel starts — a packet has to arrive inside the window, so it is a race rather than a
+certainty, which is why the scenario that caught it had passed on the four runs before.
+
+Upstream declines to guard the holder: issue #6442 proposed exactly that and was closed with
+"这是TUN入站启动过早的问题 已经修复TUN入站". Issue #6274 is the same panic reported from
+Windows. Taking the ordering fix rather than adding a nil check keeps this fork on upstream's
+line, so the eventual rebase drops the patch instead of fighting it.
+
 ## Verifying the result
 
 ```sh
