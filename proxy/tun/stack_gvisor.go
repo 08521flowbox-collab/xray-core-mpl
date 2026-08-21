@@ -33,12 +33,13 @@ const (
 
 // stackGVisor is ip stack implemented by gVisor package
 type stackGVisor struct {
-	ctx         context.Context
-	tun         GVisorTun
-	idleTimeout time.Duration
-	handler     *Handler
-	stack       *stack.Stack
-	endpoint    stack.LinkEndpoint
+	ctx          context.Context
+	tun          GVisorTun
+	idleTimeout  time.Duration
+	handler      *Handler
+	stack        *stack.Stack
+	endpoint     stack.LinkEndpoint
+	udpForwarder *udpConnectionHandler
 }
 
 // GVisorTun implements a bridge to connect gVisor ip stack to tun interface
@@ -103,19 +104,29 @@ func (t *stackGVisor) Start() error {
 	ipStack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 
 	// Use custom UDP packet handler, instead of strict gVisor forwarder, for FullCone NAT support
-	udpForwarder := newUdpConnectionHandler(t.handler.HandleConnection, t.writeRawUDPPacket)
+	udpForwarder := newUdpConnectionHandler(t.handler.HandleConnection, t.writeRawUDPPacket, t.idleTimeout)
+	t.udpForwarder = udpForwarder
 	ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
-		data := pkt.Data().AsRange().ToSlice()
-		if len(data) == 0 {
-			return false
-		}
+		// DecRef is ours, not upstream's. Clone takes a PacketBuffer out of
+		// pkPool and IncRefs a chunk per view; ToSlice below is already a
+		// caller-owned copy, so without this every UDP packet strands all
+		// three and they never return to their pools. See MODIFICATIONS.md.
+		clonedPkt := pkt.Clone()
+		data := clonedPkt.Data().AsRange().ToSlice()
+		clonedPkt.DecRef()
 		// source/destination of the packet we process as incoming, on gVisor side are Remote/Local
 		// in other terms, src is the side behind tun, dst is the side behind gVisor
 		// this function handle packets passing from the tun to the gVisor, therefore the src/dst assignement
-		src := net.UDPDestination(net.IPAddress(id.RemoteAddress.AsSlice()), net.Port(id.RemotePort))
-		dst := net.UDPDestination(net.IPAddress(id.LocalAddress.AsSlice()), net.Port(id.LocalPort))
-
-		return udpForwarder.HandlePacket(src, dst, data)
+		srcIP := net.IPAddress(id.RemoteAddress.AsSlice())
+		dstIP := net.IPAddress(id.LocalAddress.AsSlice())
+		if srcIP == nil || dstIP == nil {
+			errors.LogDebug(context.Background(), "drop udp with size ", len(data), " > invalid ip address ", id.RemoteAddress.AsSlice(), " ", id.LocalAddress.AsSlice())
+			return true
+		}
+		src := net.UDPDestination(srcIP, net.Port(id.RemotePort))
+		dst := net.UDPDestination(dstIP, net.Port(id.LocalPort))
+		udpForwarder.HandlePacket(src, dst, data)
+		return true
 	})
 
 	t.stack = ipStack
@@ -193,6 +204,14 @@ func (t *stackGVisor) Close() error {
 		return nil
 	}
 	t.endpoint.Attach(nil)
+	// Drained after Attach(nil), not before: that call stops the inbound
+	// dispatchers and Waits for them to leave dispatchLoop, so once it returns
+	// nothing can deliver another packet and put a flow back into the table
+	// behind the drain. Draining first would leave whatever arrived in the gap
+	// with no reaper left to collect it.
+	if t.udpForwarder != nil {
+		t.udpForwarder.Close()
+	}
 	t.stack.Close()
 	for _, endpoint := range t.stack.CleanupEndpoints() {
 		endpoint.Abort()

@@ -259,6 +259,173 @@ Upstream declines to guard the holder: issue #6442 proposed exactly that and was
 Windows. Taking the ordering fix rather than adding a nil check keeps this fork on upstream's
 line, so the eventual rebase drops the patch instead of fighting it.
 
+## Fixing the tun UDP FullCone NAT panic and a domain-typed reply
+
+Not a licence change. Cherry-picks of two upstream fixes to `proxy/tun/udp_fullcone.go`, taken
+because upstream hit both of them as real production crashes and this fork's pin predates both.
+
+**`send on closed channel` (upstream #5888, merged 2026-04-05, nine days after the `26.3.27`
+commit this fork pins).** The original `HandlePacket` released `udpConnectionHandler`'s mutex
+before sending on `conn.egress`; `connectionFinished` closes that same channel under the same
+mutex. A packet for a flow and that flow's own teardown landing at nearly the same instant could
+race the send against the close. Upstream hit this twice in production — XTLS/Xray-core#5895
+("TUN Panic", several weeks of normal operation before it fired) and its duplicate #5930 ("经过
+一晚后代理退出") — both with the identical trace, `panic: send on closed channel` at
+`udp_fullcone.go:47`. The fix restructures the lock around an `RWMutex`: an existing flow is
+found and written to under a *read* lock held across the send, so `connectionFinished`'s
+exclusive lock (and therefore the `close`) cannot proceed until every in-flight send has
+finished. Also bundled: the buffer channel grows from 16 to 1024 entries, a dropped packet logs
+at debug instead of vanishing silently, and `packet` now carries its destination alongside the
+payload rather than losing it, which is what let `ReadMultiBuffer`/`WriteMultiBuffer` be added
+in the same change.
+
+**Domain-typed reply address (part of upstream #6285, merged 2026-06-09; only the
+`proxy/tun/udp_fullcone.go` hunk applies — the rest of that PR touches `proxy/wireguard`, which
+this fork does not carry, see "Removing `proxy/wireguard`").** `WriteMultiBuffer` used
+`b.UDP`'s address unconditionally as the reply destination. If an outbound ever hands back a
+`net.Destination` carrying a domain rather than an IP — which XTLS/Xray-core#6279 shows
+happening with the `dns` and `hysteria2` outbounds specifically, both of which answer through
+`proxy/tun` on this fork's own path (`dns-out` is exactly how a FakeDNS-only reply gets back to
+the tun) — `writePacket` has no address to build an IP/UDP header from. The fix keeps the
+original target and logs instead of using the domain, rather than letting a downstream outbound
+choose an address `writePacket` cannot use.
+
+| File | Change |
+|---|---|
+| `proxy/tun/udp_fullcone.go` | Both fixes verbatim from upstream (`HandlePacket`'s `RWMutex` restructuring, `packet` gaining a `dest` alongside `data`, `ReadMultiBuffer`/`Read`/`WriteMultiBuffer`/deadline methods added, and the `IsDomain()` guard in `WriteMultiBuffer`). |
+| `proxy/tun/stack_gvisor.go` | The UDP transport handler callback matches upstream's post-#5888 shape (`pkt.Clone()`, an invalid-address guard that logs and drops rather than the caller's own bounds check, always `return true`), **plus a `DecRef` upstream does not have** — see below. One line dropped rather than carried over: upstream's own PR left the old `if len(data) == 0 { return false }` in as a commented-out remnant; there is nothing for it to do once the invalid-address guard replaces its job, so it is gone rather than sitting here dead. |
+| `proxy/tun/udp_fullcone_test.go` | Ours, not upstream's — see the next section, which reuses this file. |
+
+**The `DecRef` is ours, and #5888 needs it.** Upstream writes the whole thing as one expression,
+`pkt.Clone().Data().AsRange().ToSlice()`, and never releases what `Clone` handed it.
+`PacketBuffer.Clone` is not a refcount bump on the same object: it takes a fresh `PacketBuffer`
+out of `pkPool`, calls `buf.Clone()` — which for every view does `chunk.IncRef()` and takes a
+`View` out of `viewPool` — and `InitRefs()` the result to 1. `Range.ToSlice` is already a
+`make`-and-copy the caller owns outright, so by the end of that expression the clone is garbage
+that nothing will ever `DecRef`: one `PacketBuffer`, one `View` per view and one held chunk
+reference per UDP packet, none of which return to their pools. Go's GC reclaims the memory, so
+this is allocation churn rather than an unbounded leak — but it is churn proportional to UDP
+packet rate, on a tun where every DNS query and QUIC handshake is a UDP packet.
+
+Kept as `Clone` + `DecRef` rather than dropped entirely, though **the `Clone` earns nothing**:
+`ToSlice` copies synchronously, before `HandlePacket` is called, so the pre-#5888
+`pkt.Data().AsRange().ToSlice()` is exactly equivalent and does none of this work. Keeping
+upstream's shape and adding the one missing line makes the eventual rebase a no-op instead of a
+conflict; deleting the `Clone` would be the faster code and can be done later, on purpose,
+rather than as a side effect of taking a crash fix.
+
+Not otherwise brought current with upstream `main`: the tun package there has since grown ICMPv4/
+ICMPv6 inbound support (`handleICMPv4Packet`/`handleICMPv6Packet`, a `Tun` interface change,
+`createStack` registering `icmp.NewProtocol4/6`) and, oddly, replaced the invalid-address guard
+this cherry-pick keeps with a bare `panic(id)`. Both are unrelated to what these two fixes are
+for and pulling either in is a separate decision, not a side effect of taking a crash fix.
+
+## Aging the tun UDP NAT table independently of downstream handlers
+
+Not a licence change. Behaviour fix, reasoned from the code rather than measured against a
+live repro — see the caveat at the end. Builds on the cherry-picks immediately above: it needs
+their `RWMutex` to stay race-free (see below), and the two are meant to be read together.
+
+`proxy/tun/udp_fullcone.go`'s `udpConns` map has no timeout of its own, cherry-picks above
+included — `SetDeadline`/`SetReadDeadline`/`SetWriteDeadline` are still no-ops upstream. A flow
+is removed only when something calls `udpConn.Close()`, and the only caller of that is
+`Handler.HandleConnection`'s `defer conn.Close()` — which does not run until
+`dispatcher.DispatchLink` returns, i.e. until whatever downstream handler is proxying that flow
+decides on its own that it is idle. `proxy/dns.Handler.Process` does this correctly, via
+`ConnectionIdle` (300s by default) — but a flow that gets exactly one packet, the common case
+for a DNS query answered out of a fake-IP pool, leaves both the map entry and
+`handleConnection`'s goroutine (blocked reading `conn.egress`, which nothing will write to
+again) alive for **twice** that, around 600s, before the downstream idle timer unwinds back to
+the `defer`.
+
+Twice, not once, and the doubling is not a rounding error: `signal.CancelAfterInactivity` is a
+`task.Periodic` ticking at `ConnectionIdle`, whose `check()` only asks whether an `Update`
+landed since the previous tick. `proxy/dns` plants one at `dns.go:191` when it reads the single
+query, so the tick at t=300s is spent eating that token and only the tick at t=600s calls
+`terminate`. (The token `SetTimeout` itself plants at `timer.go:74` is *not* the one that
+survives — `task.Periodic.Start` runs the first `check()` synchronously at t=0 and eats it
+immediately, by design: `SetTimeout` holds `t.mu` across `Start()` and `check()`→`finish()`
+re-takes it, so an empty channel there would self-deadlock.) Measured on this tree by driving
+the real `proxy/dns.Handler.Process` with a one-shot fake-IP query: with `ConnectionIdle` at
+300ms, `Process` returned after 601ms, 2.00×.
+
+Under a busy tun in "global mode" — every DNS lookup and every QUIC handshake attempt goes
+through this same table — steady state is therefore (new-flow rate) × ~600s worth of these, all
+sharing one lock.
+
+Checked against upstream `main` (past the cherry-picks above): the architecture has not
+changed since — no aging was ever added, just the `RWMutex`/buffer/logging work described
+above. `sing`'s NAT table (`sagernet/sing/common/udpnat`, and its successor `common/udpnat2`)
+does the opposite: the table itself is a TTL cache (`cache.LruCache` / `freelru.Cache`) that
+evicts and closes on its own schedule, independent of whatever the downstream handler does;
+sing-box exposes this as `udp_timeout`/`udp_nat_max` on its tun inbound. This patch gives
+Xray's table the same property without a cache dependency — a `time.Ticker` owned by
+`udpConnectionHandler` itself.
+
+| File | Change |
+|---|---|
+| `proxy/tun/udp_fullcone.go` | `udpConn` gets `lastActive atomic.Int64`, touched on every packet `HandlePacket` accepts, in both the read-lock fast path and the write-lock slow path. `udpConnectionHandler` gets `idleTimeout`, `reapLoop` (a ticker at `idleTimeout/4`) and `reapExpired`, which closes anything `reapLoop` finds stale — through the existing `Close()` → `connectionFinished()` path, not a new one. `newUdpConnectionHandler` takes `idleTimeout` and starts the loop when it is positive; `Close()` stops it, idempotently (`sync.Once`), **and drains what is left** — see below. Both the sweep and the drain go through one `evict` helper. `connectionFinished` takes the `*udpConn` as well as its key — also below. |
+| `proxy/tun/stack_gvisor.go` | `stackGVisor` keeps the `*udpConnectionHandler` it builds in `Start`, passes it `t.idleTimeout`, and calls the handler's `Close` from `stackGVisor.Close` — *after* `endpoint.Attach(nil)`, see below. |
+| `proxy/tun/udp_fullcone_test.go` | Ours. Pins that an idle flow gets reaped, that an active one does not, that `Close` drains live flows, that a late second close cannot evict a reused source port, and — under `-race` — that a reap racing an ordinary packet cannot panic (a regression guard for the exact shape of #5895/#5930, since this patch calls `Close()` far more often than upstream ever did). |
+
+**Why this is safe under the cherry-picked locking, not merely compatible with it.** `evict`
+does the whole sweep — decide, `delete`, `close(conn.egress)` — under one exclusive `Lock()`,
+which is the same lock upstream's fix already serialises `HandlePacket`'s in-flight sends
+against, so nothing here reopens the window #5888 closed. Deleting during `range` is legal and
+`close` never blocks, so holding the lock across the sweep costs nothing. It deliberately does
+*not* route through `conn.Close()`: that re-enters this same lock via `connectionFinished`, and
+a `sync.RWMutex` is not reentrant. The obvious alternative — collect under `RLock`, release,
+then `conn.Close()` each one — avoids the deadlock but reintroduces a check-then-act window, in
+which a packet can arrive on a flow already marked stale, be accepted onto its `egress`, and
+have the flow torn down under it anyway.
+
+**`Close` drains, and the ordering in `stackGVisor.Close` is what makes the drain complete.**
+`endpoint.Attach(nil)` calls `Stop()` on every inbound dispatcher and then `Wait()`s for them to
+leave `dispatchLoop`, so once it returns nothing can deliver another packet. Draining after it
+is therefore final; draining before it would leave anything that arrived in the gap sitting in
+the table with the reaper already stopped. Measured before the drain existed: 100 one-shot
+flows, `Close()`, then ten times `idleTimeout` — still 100 entries and 100 blocked goroutines.
+`TestCloseDrainsLiveFlows` pins it and fails without the drain.
+
+Worth being precise about what this is: not a regression the reaper introduced, since a
+pre-patch shutdown strands the same flows and more (nothing aged the table during the session
+either). It is an improvement the first draft left unrealised — `Close()` stopped the one
+mechanism that could have collected them and put nothing in its place.
+
+**Calling it far more often is what forced the `connectionFinished` signature change.** Every
+reaped flow is now closed *twice*: once by `reapExpired`, and again by `HandleConnection`'s own
+`defer conn.Close()` once that first close unblocks the goroutine's read. Upstream only ever
+closed once, so keying the eviction purely on `src` was fine there. Here the second close can
+land after the same source port has been handed to a brand-new flow — an ephemeral port that
+just sat idle long enough to be reaped is exactly a port the OS is free to reuse — and a
+`src`-keyed eviction would then delete and `close(egress)` on a live conn that had just started,
+killing a working flow for no reason a user could ever connect to a cause. `connectionFinished`
+therefore takes the `*udpConn` too and evicts only when the map still holds *that* conn;
+a late second close for a replaced key is a no-op. `TestSecondCloseDoesNotEvictAReusedSource`
+pins it, and fails (panicking in `close(conn.egress)`) with the identity check removed.
+
+**`StackOptions.IdleTimeout` was already there and already unused.** `stack_gvisor.go` has
+stored `options.IdleTimeout` in a field named `idleTimeout` since that field existed, and
+nothing ever read it — dead configuration that looks like it was meant for exactly this. It is
+populated in `handler.go`'s `Start` from
+`t.policyManager.ForLevel(t.config.UserLevel).Timeouts.ConnectionIdle` — the identical
+expression `proxy/dns` reads its own timeout from at `dns.go:59` — so the reap interval tracks
+whatever `ConnectionIdle` a caller's policy config sets, 300s by default.
+
+That is the same *setting*, but deliberately not the same *dwell*. Because `reapLoop` tickets
+at `idleTimeout/4` and compares strictly, a flow is reaped in (300s, 375s] after its last
+packet, against the ~600s established above for `proxy/dns` — so this is not merely a
+redundant second enforcer of a deadline something else already met, it roughly halves the
+worst case. And for flows whose downstream handler has no idle deadline at all — a QUIC
+handshake through the `freedom` outbound is the obvious one — it is the only bound there is.
+
+Not measured against a live repro: reasoned from the code path, not pulled from a goroutine
+dump taken during an actual long-running session. If it does not move the needle on the
+consumer-side report this was written for (zapsplit-v2 issue #57 — DNS resolution failing
+roughly 20 minutes into a "global mode" connection), the next thing to check is whether
+`udpConns`'s size and Go's live goroutine count actually grow unboundedly before this patch and
+plateau after it.
+
 ## Verifying the result
 
 ```sh
