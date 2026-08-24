@@ -19,9 +19,23 @@ type LeastLoadStrategy struct {
 	settings *StrategyLeastLoadConfig
 	costs    *WeightManager
 
+	// byLatency ranks on average round trip instead of its deviation. The
+	// deviation ranks the steadiest path first, which is the right answer for a
+	// long-lived tunnel and the wrong one for "put me on the nearest exit" —
+	// and with a small sampling count it is mostly noise, so the pick wanders
+	// between machines every round.
+	byLatency bool
+
 	observer extension.Observatory
 
 	ctx context.Context
+}
+
+func (s *LeastLoadStrategy) ranking(ping *observatory.HealthPingMeasurementResult) int64 {
+	if s.byLatency {
+		return ping.Average
+	}
+	return ping.Deviation
 }
 
 func (l *LeastLoadStrategy) GetPrincipleTarget(strings []string) []string {
@@ -34,9 +48,10 @@ func (l *LeastLoadStrategy) GetPrincipleTarget(strings []string) []string {
 }
 
 // NewLeastLoadStrategy creates a new LeastLoadStrategy with settings
-func NewLeastLoadStrategy(settings *StrategyLeastLoadConfig) *LeastLoadStrategy {
+func NewLeastLoadStrategy(settings *StrategyLeastLoadConfig, byLatency bool) *LeastLoadStrategy {
 	return &LeastLoadStrategy{
-		settings: settings,
+		settings:  settings,
+		byLatency: byLatency,
 		costs: NewWeightManager(
 			settings.Costs, 1,
 			func(value, cost float64) float64 {
@@ -169,7 +184,7 @@ func (s *LeastLoadStrategy) getNodes(candidates []string, maxRTT time.Duration) 
 			if v.HealthPing != nil {
 				record.RTTAverage = time.Duration(v.HealthPing.Average)
 				record.RTTDeviation = time.Duration(v.HealthPing.Deviation)
-				record.RTTDeviationCost = time.Duration(s.costs.Apply(v.OutboundTag, float64(v.HealthPing.Deviation)))
+				record.RTTDeviationCost = time.Duration(s.costs.Apply(v.OutboundTag, float64(s.ranking(v.HealthPing))))
 				record.CountAll = int(v.HealthPing.All)
 				record.CountFail = int(v.HealthPing.Fail)
 

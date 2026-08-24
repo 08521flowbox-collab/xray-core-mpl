@@ -426,6 +426,28 @@ roughly 20 minutes into a "global mode" connection), the next thing to check is 
 `udpConns`'s size and Go's live goroutine count actually grow unboundedly before this patch and
 plateau after it.
 
+## Adding a `leastlatency` balancer strategy
+
+None of the three upstream strategies answers "put me on the nearest exit":
+
+- `leastload` ranks on **jitter**, not latency. `leastloadSort` compares `RTTDeviationCost`
+  (`Deviation × sqrt(cost)`) first and only falls back to `RTTAverage` on a tie. Ranking the
+  steadiest path first is right for a long-lived tunnel and wrong for "nearest"; and with a
+  small sampling count the deviation is mostly noise, so the pick wanders between machines
+  every check round.
+- `leastping` ranks on latency but ignores `costs` entirely, so any weighting scheme built on
+  top of it is silently discarded.
+- `roundrobin` and `random` do not consider the observations at all.
+
+| File | Change |
+|---|---|
+| `app/router/strategy_leastload.go` | `LeastLoadStrategy` gains a `byLatency bool` and a `ranking(*observatory.HealthPingMeasurementResult) int64` helper; `getNodes` feeds `ranking(...)` to `costs.Apply` instead of `HealthPing.Deviation`. `NewLeastLoadStrategy` takes the flag as a second parameter. |
+| `app/router/config.go` | `BalancingRule.Build`'s switch matches `"leastload", "leastlatency"` and passes `strings.ToLower(br.Strategy) == "leastlatency"`. Both read the same `StrategyLeastLoadConfig`. |
+
+`leastload`'s own behaviour is unchanged, which keeps the merge surface against upstream to
+two lines. Everything else — `Expected`, `Baselines`, `MaxRTT`, the cost ladder, `FallbackTag`
+— works identically under both names.
+
 ## Verifying the result
 
 ```sh
