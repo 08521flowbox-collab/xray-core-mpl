@@ -5,6 +5,9 @@ package tun
 import (
 	"crypto/md5"
 	"errors"
+	"os"
+	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -26,6 +29,17 @@ type WindowsTun struct {
 	session  wintun.Session
 	readWait windows.Handle
 	MTU      uint32
+
+	// The Wintun send and receive rings are memory shared with the driver, and
+	// session.End tears that mapping down. Every use of session below is
+	// therefore held under mu as a reader while Close takes it as the writer,
+	// so that End cannot run while a packet is still in flight. Without this a
+	// VLESS UDP return path outliving core.Close writes into freed pages —
+	// 0xc0000005 on a plain machine, and an invalid session handed to the NDIS
+	// filter chain on one carrying third-party filters.
+	mu        sync.RWMutex
+	closeOnce sync.Once
+	closed    atomic.Bool
 }
 
 // WindowsTun implements Tun
@@ -88,17 +102,38 @@ func (t *WindowsTun) Start() error {
 }
 
 func (t *WindowsTun) Close() error {
-	t.session.End()
-	_ = t.adapter.Close()
+	t.closeOnce.Do(func() {
+		// The flag and the event come before the lock: readers parked in Wait
+		// hold no lock but would never wake on their own, and they have to see
+		// the flag on the ReadPacket that follows.
+		t.closed.Store(true)
+		_ = windows.SetEvent(t.readWait)
+
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		t.session.End()
+		_ = t.adapter.Close()
+	})
 
 	return nil
 }
 
 // WritePacket implements GVisorDevice method to write one packet to the tun device
 func (t *WindowsTun) WritePacket(packetBuffer *stack.PacketBuffer) tcpip.Error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.closed.Load() {
+		return &tcpip.ErrClosedForSend{}
+	}
+
 	// request buffer from Wintun
 	packet, err := t.session.AllocateSendPacket(packetBuffer.Size())
 	if err != nil {
+		// A full ring is back-pressure, not a failure: dropping is what the
+		// link layer does, while ErrAborted would travel back up the stack.
+		if errors.Is(err, windows.ERROR_BUFFER_OVERFLOW) {
+			return nil
+		}
 		return &tcpip.ErrAborted{}
 	}
 
@@ -118,6 +153,14 @@ func (t *WindowsTun) WritePacket(packetBuffer *stack.PacketBuffer) tcpip.Error {
 // It is expected that the method will not block, rather return ErrQueueEmpty when there is nothing on the line,
 // which will make the stack call Wait which should implement desired push-back
 func (t *WindowsTun) ReadPacket() (byte, *stack.PacketBuffer, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.closed.Load() {
+		// Anything other than ErrQueueEmpty ends dispatchLoop, which is what a
+		// closed device wants: Wait would otherwise park it on a dead handle.
+		return 0, nil, os.ErrClosed
+	}
+
 	packet, err := t.session.ReceivePacket()
 	if errors.Is(err, windows.ERROR_NO_MORE_ITEMS) {
 		return 0, nil, ErrQueueEmpty
@@ -131,13 +174,25 @@ func (t *WindowsTun) ReadPacket() (byte, *stack.PacketBuffer, error) {
 	return version, stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload:           packetBuffer,
 		IsForwardedPacket: true,
+		// The packet is handed over without a copy, so this runs long after
+		// ReadPacket returned and needs the lock of its own. After End the
+		// whole ring is gone and releasing one packet out of it would be the
+		// same use-after-free.
 		OnRelease: func() {
+			t.mu.RLock()
+			defer t.mu.RUnlock()
+			if t.closed.Load() {
+				return
+			}
 			t.session.ReleaseReceivePacket(packet)
 		},
 	}), nil
 }
 
 func (t *WindowsTun) Wait() {
+	if t.closed.Load() {
+		return
+	}
 	procyield(1)
 	_, _ = windows.WaitForSingleObject(t.readWait, windows.INFINITE)
 }
