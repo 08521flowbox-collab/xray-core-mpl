@@ -319,8 +319,27 @@ func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context,
 		ctx = routing_dns.ContextWithDNSClient(ctx, r.dns)
 	}
 
-	for _, rule := range s.rules {
+	for i, rule := range s.rules {
 		if rule.Apply(ctx) {
+			// A first-pass match on the *last* rule is provisional under
+			// IpIfNonMatch. This consumer's rule table ends in a catch-all that
+			// matches every connection, and with it in place "no rule matched"
+			// — the condition the second, resolving pass hangs from — can never
+			// occur: an address rule sitting above the catch-all could never
+			// fire against a domain target. Resolving here and re-walking the
+			// earlier rules restores the semantics the strategy promises; the
+			// catch-all keeps the connection only when the resolved address
+			// still matches nothing above it. A table without a catch-all is
+			// untouched — its unmatched connections still take the pass below.
+			if i == len(s.rules)-1 && s.domainStrategy == Config_IpIfNonMatch &&
+				len(ctx.GetTargetDomain()) > 0 && !skipDNSResolve {
+				resolving := routing_dns.ContextWithDNSClient(ctx, r.dns)
+				for _, earlier := range s.rules[:i] {
+					if earlier.Apply(resolving) {
+						return earlier, resolving, nil
+					}
+				}
+			}
 			return rule, ctx, nil
 		}
 	}

@@ -131,6 +131,32 @@ keeps the live one, because an appended config carries the zero value (`AsIs`) w
 its author meant to say anything about the strategy. `TestReloadUpdatesDomainStrategy` and
 `TestAppendingRulesKeepsTheStrategy`.
 
+## Letting `IpIfNonMatch` see past a catch-all rule
+
+Not a licence change. One behaviour change in `app/router/router.go`'s `pickRouteInternal`,
+2026-08-31.
+
+Upstream's `IpIfNonMatch` resolves and re-walks the table only when *no* rule matched. This
+consumer's table ends in a catch-all (`sys:default` — the unified shape names its default exit
+in a rule, because the default can be a balancer and Outbound[0] is deliberately a blackhole),
+and a rule that matches every connection makes "no rule matched" unreachable: the resolving
+second pass never ran, so an address rule (`geoip:` / CIDR) above the catch-all could never
+fire against a sniffed domain target. "Send this country through that exit" silently applied
+only to literal-IP connections.
+
+The change: under `IpIfNonMatch`, a first-pass match on the **last** rule of the table is
+provisional when the target is a domain (and `SkipDNSResolve` is not set). The router resolves
+and re-walks the rules *above* it; an earlier rule that matches the resolved address takes the
+connection, otherwise the last rule keeps it. A match on any earlier rule is final, exactly as
+before — resolution stays the price of falling through to the bottom of the table, not of
+routing. Tables without a catch-all are untouched: their unmatched connections still reach the
+original second pass.
+
+`TestCatchAllMatchIsProvisionalUnderIpIfNonMatch`,
+`TestCatchAllKeepsTheConnectionWhenResolutionMatchesNothing`,
+`TestCatchAllDoesNotResolveUnderAsIs` and `TestAMatchAboveTheCatchAllDoesNotResolve` in
+`app/router/router_catchall_test.go`.
+
 ## Letting the test suite run without the geodata downloads
 
 Not a licence change, and not a behaviour change either — this one is only about the tests
