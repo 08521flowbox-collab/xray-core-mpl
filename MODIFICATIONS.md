@@ -452,15 +452,50 @@ roughly 20 minutes into a "global mode" connection), the next thing to check is 
 `udpConns`'s size and Go's live goroutine count actually grow unboundedly before this patch and
 plateau after it.
 
-### Flows to port 53 age on their own clock (2026-09-03)
+### Flows age on a per-port clock; the table evicts instead of refusing (2026-09-03)
 
 Measured on the iOS packet tunnel during a speed test: a goroutine profile taken at 40 MB
 held 198 UDP flows to port 53, three goroutines each, all finished — one query, one answer —
-and all waiting out `ConnectionIdle` (300 s). `reapExpired` now ages a flow whose
-destination port is 53 on `dnsFlowIdle` (10 s, the same number sing-box uses for
-`ProtocolDNS`), and `reapLoop` ticks at `min(idleTimeout/4, dnsFlowIdle/2)` so that clock is
-actually observed. Every other flow keeps `idleTimeout`. `TestDNSFlowIsReapedEarly` pins both
-halves.
+and all waiting out `ConnectionIdle` (300 s). Three changes, all lifted from what sing-box's
+`udpnat2` does by default:
+
+- `portIdle` maps a destination port to a shorter idle: 53, 123 and 3478 (DNS, NTP, STUN)
+  age on 10 s, 443 (QUIC) on 30 s; everything else keeps `idleTimeout`. `reapLoop` ticks at
+  a quarter of the shortest entry so those clocks are actually observed.
+- A full table (`maxUDPFlows`) no longer refuses the new flow. `evictOldestLocked` closes the
+  flow with the oldest `lastActive` and the newcomer takes its place; the `evictions` counter
+  replaces `fullDrops`, logging the first and every thousandth.
+- A flow's egress queue is 64 packets, not 1024. At the old depth one burst on one flow
+  could hold 1024 × MTU ≈ 4 MiB of packets on a 50 MB budget.
+
+`TestDNSFlowIsReapedEarly` and `TestHandlePacketEvictsTheOldestFlowWhenTheTableIsFull` pin
+the first two.
+
+## Answering tun DNS queries without a NAT flow
+
+Not a licence change. Before this every DNS query from the tun became a UDP flow: a NAT
+entry, an egress channel, three goroutines and a `proxy/dns` dispatch — for one datagram in
+and one out. sing-box short-circuits this (`ActionHijackDNS` → `HijackDNSPacket` →
+`ExchangeAsync`) and so does this fork now.
+
+`proxy/tun/dns_fastpath.go` is the whole of it. `udpConnectionHandler.hijackDNS` is consulted
+for port-53 packets **after** the `ownPort` check — that order is load-bearing: if the DNS
+client's own upstream query ever re-entered the tun it would otherwise answer itself forever —
+and before the flow table is touched. The packet is parsed with `dnsmessage.Parser`; a
+response, or anything that does not parse, is handed back to the flow path unchanged. A
+non-INET or non-A/AAAA question gets REFUSED synchronously. An A/AAAA question goes to
+`dns.Client.LookupIP` on its own goroutine with `FakeEnable: true` — the same call and the
+same option `proxy/dns` makes, so FakeDNS answers exactly as before — and the reply is written
+straight back through `writeRawUDPPacket`, rcode via `dns.RCodeFromError`. Counters:
+`answered`, `refused`, `failed`.
+
+| File | Change |
+|---|---|
+| `proxy/tun/dns_fastpath.go` | **New.** `dnsFastPath{client, write}`; `Handle(src, dst, payload) bool`; `buildDNSReply`. |
+| `proxy/tun/handler.go` | `Init` takes the `dns.Client` feature; `dnsHijack(write)` builds the fast path, or returns nil when there is no DNS client. |
+| `proxy/tun/udp_fullcone.go` | `hijackDNS` hook in `HandlePacket`, between `ownPort` and the table. |
+| `proxy/tun/stack_gvisor.go` | wires `udpForwarder.hijackDNS = t.handler.dnsHijack(t.writeRawUDPPacket)`. |
+| `proxy/tun/dns_fastpath_test.go` | **New.** A fake `dns.Client`: an A query is answered with no flow made; a non-IP query is REFUSED; garbage falls through to the flow path; `HandlePacket` consults the fast path before making a flow. |
 
 ## Adding a `leastlatency` balancer strategy
 
@@ -548,6 +583,26 @@ NetworkExtension opened for its own utun and we only borrow it:
 | `proxy/tun/tun_darwin.go` | `DarwinTun.fd int` instead of `*os.File`; `unix.Read`/`unix.Write` with `EAGAIN`→`ErrQueueEmpty`/`ErrWouldBlock`; `Wait` is `unix.Poll(POLLIN, 100ms)`; the `procyield` linkname is gone; `open` returns the raw descriptor. |
 | `proxy/tun/stack_gvisor_endpoint.go` | `LinkEndpoint.dispatcherDone`; `Attach`/`Close` go through `stopDispatcher`, which cancels and then waits; the dispatch loop's read-error branch logs and returns rather than re-entering `Attach`. |
 | `proxy/tun/tun_darwin_test.go` | **New.** A `socketpair` stands in for the utun: the injected descriptor is read with its 4-byte family header, written back with one, and `Attach(nil)` returns inside 200 ms with the goroutine gone. |
+
+## Reading the Darwin tun in batches
+
+Not a licence change. `ReadPacket` made one `read(2)` per packet, and `dispatchLoop` one
+`poll(2)` per empty read. sing-tun reads its utun with `recvmsg_x(2)`, XNU's batch receive,
+and so does this fork now: `rxBatch` holds `rxBatchSize` (32) slots of MTU+4 bytes,
+allocated once (~130 KiB at MTU 4064), and `ReadPacket` hands them out one at a time,
+refilling with a single non-blocking `recvmsg_x` only when the batch is drained. Header-only
+datagrams are skipped inside the batch rather than surfaced as `ErrQueueEmpty`, so one stray
+datagram no longer costs a 100 ms poll. The slots can be reused straight away because gVisor's
+`buffer.MakeWithData` copies the payload into its own view; the pooled `buf.Buffer` and its
+`OnRelease` were only ever there to be freed and are gone.
+
+The write side is unchanged. `sendmsg_x` is behind an experimental flag in sing-tun
+(`EXP_SendMsgX`, off by default) and stays out of here for the same reason.
+
+| File | Change |
+|---|---|
+| `proxy/tun/tun_darwin.go` | `msgHdrX`, `rxBatch`, `newRxBatch`, `rxBatch.fill` (one `RawSyscall6(SYS_RECVMSG_X, …, MSG_DONTWAIT)`); `ReadPacket` drains the batch. |
+| `proxy/tun/tun_darwin_test.go` | Six datagrams on the socketpair land in one `recvmsg_x`, header-only ones are skipped, and a packet's bytes survive the slot being refilled. |
 
 ## Letting the host size the tun's TCP buffers
 

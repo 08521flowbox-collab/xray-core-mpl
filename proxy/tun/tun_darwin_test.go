@@ -141,3 +141,68 @@ func TestDarwinEndpointDetachWaitsForDispatchLoop(t *testing.T) {
 	}
 	t.Logf("Attach(nil) returned in %v", elapsed)
 }
+
+func TestDarwinTunDrainsABatchAndSkipsHeaderOnlyDatagrams(t *testing.T) {
+	tun, peer := injectedTun(t)
+	sizes := []int{8, 40, 1200}
+	for _, size := range sizes {
+		if _, err := unix.Write(peer, ipv4Packet(size)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := unix.Write(peer, []byte{0, 0, 0, unix.AF_INET}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, size := range sizes {
+		version, pb, err := tun.ReadPacket()
+		if err != nil {
+			t.Fatalf("packet %d: %v", i, err)
+		}
+		if version != 4 || pb.Size() != 20+size {
+			t.Fatalf("packet %d: version %d size %d, want 4/%d", i, version, pb.Size(), 20+size)
+		}
+		pb.DecRef()
+	}
+	if tun.rx.n != 2*len(sizes) {
+		t.Fatalf("batch held %d datagrams, want %d in one recvmsg_x", tun.rx.n, 2*len(sizes))
+	}
+	if _, _, err := tun.ReadPacket(); err != ErrQueueEmpty {
+		t.Fatalf("empty read err = %v, want ErrQueueEmpty", err)
+	}
+	if _, err := unix.Write(peer, ipv4Packet(16)); err != nil {
+		t.Fatal(err)
+	}
+	if _, pb, err := tun.ReadPacket(); err != nil || pb.Size() != 36 {
+		t.Fatalf("after refill: size %d err %v", pb.Size(), err)
+	} else {
+		pb.DecRef()
+	}
+}
+
+func TestDarwinTunPayloadOutlivesTheSlot(t *testing.T) {
+	tun, peer := injectedTun(t)
+	first := ipv4Packet(8)
+	first[len(first)-1] = 0xAA
+	if _, err := unix.Write(peer, first); err != nil {
+		t.Fatal(err)
+	}
+	_, pb, err := tun.ReadPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pb.DecRef()
+	second := ipv4Packet(8)
+	second[len(second)-1] = 0xBB
+	if _, err := unix.Write(peer, second); err != nil {
+		t.Fatal(err)
+	}
+	if _, pb2, err := tun.ReadPacket(); err != nil {
+		t.Fatal(err)
+	} else {
+		pb2.DecRef()
+	}
+	got := pb.ToView().AsSlice()
+	if got[len(got)-1] != 0xAA {
+		t.Fatalf("first packet's last byte became %#x after the slot was reused", got[len(got)-1])
+	}
+}

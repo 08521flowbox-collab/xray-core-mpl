@@ -25,7 +25,7 @@ func TestInitDoesNotBringTheInterfaceUp(t *testing.T) {
 	ctx := context.WithValue(context.Background(), core.XrayKey(1), instance)
 
 	handler := &Handler{config: &Config{Name: "zaptun-test", MTU: 9000}}
-	common.Must(handler.Init(ctx, policy.DefaultManager{}, nil))
+	common.Must(handler.Init(ctx, policy.DefaultManager{}, nil, nil))
 
 	if handler.tun != nil {
 		t.Fatal("Init created a tun interface; only Start may")

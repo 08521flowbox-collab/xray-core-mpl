@@ -13,6 +13,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
@@ -28,6 +29,7 @@ type Handler struct {
 	stack           Stack
 	policyManager   policy.Manager
 	dispatcher      routing.Dispatcher
+	dnsClient       dns.Client
 	tag             string
 	sniffingRequest session.SniffingRequest
 }
@@ -61,7 +63,7 @@ func (t *Handler) policy() policy.Session {
 // `net.(*IPNet).Contains`. Upstream #6442 reports exactly that and was closed
 // with "这是TUN入站启动过早的问题 已经修复TUN入站": the fix is the ordering,
 // not a nil guard on the holder. See [Handler.Start] and MODIFICATIONS.md.
-func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routing.Dispatcher) error {
+func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routing.Dispatcher, dnsClient dns.Client) error {
 	// Retrieve tag and sniffing config from context (set by AlwaysOnInboundHandler)
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		t.tag = inbound.Tag
@@ -73,8 +75,19 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 	t.ctx = core.ToBackgroundDetachedContext(ctx)
 	t.policyManager = pm
 	t.dispatcher = dispatcher
+	t.dnsClient = dnsClient
 
 	return nil
+}
+
+// dnsHijack hands the stack a port-53 answerer bound to the DNS client, or
+// nil when there is none to bind. See dns_fastpath.go.
+func (t *Handler) dnsHijack(write func(payload []byte, src, dst net.Destination) error) func(src, dst net.Destination, data []byte) bool {
+	if t.dnsClient == nil {
+		return nil
+	}
+	fp := &dnsFastPath{client: t.dnsClient, write: write}
+	return fp.Handle
 }
 
 // Start implements common.Runnable, and it is where the interface comes up.
@@ -229,8 +242,8 @@ func (t *Handler) Process(ctx context.Context, network net.Network, conn stat.Co
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		t := &Handler{config: config.(*Config)}
-		err := core.RequireFeatures(ctx, func(pm policy.Manager, dispatcher routing.Dispatcher) error {
-			return t.Init(ctx, pm, dispatcher)
+		err := core.RequireFeatures(ctx, func(pm policy.Manager, dispatcher routing.Dispatcher, dnsClient dns.Client) error {
+			return t.Init(ctx, pm, dispatcher, dnsClient)
 		})
 		return t, err
 	}))

@@ -249,7 +249,7 @@ func TestHandlePacketDropsAFlowThatCameFromOurOwnSocket(t *testing.T) {
 	}
 }
 
-func TestHandlePacketDropsNewFlowsWhenTheTableIsFull(t *testing.T) {
+func TestHandlePacketEvictsTheOldestFlowWhenTheTableIsFull(t *testing.T) {
 	handler := newUdpConnectionHandler(
 		func(conn net.Conn, dest net.Destination) {
 			buf := make([]byte, 1)
@@ -275,23 +275,24 @@ func TestHandlePacketDropsNewFlowsWhenTheTableIsFull(t *testing.T) {
 	if flows != maxUDPFlows {
 		t.Fatalf("flows = %d, expected %d", flows, maxUDPFlows)
 	}
-	if n := handler.fullDrops.Load(); n != 10 {
-		t.Fatalf("fullDrops = %d, expected 10", n)
+	if n := handler.evictions.Load(); n != 10 {
+		t.Fatalf("evictions = %d, expected 10", n)
 	}
-
-	handler.HandlePacket(net.UDPDestination(net.LocalHostIP, 1000), dst, []byte{2})
-	if n := handler.fullDrops.Load(); n != 10 {
-		t.Fatalf("a packet on an existing flow was dropped: fullDrops = %d", n)
+	handler.RLock()
+	_, newest := handler.udpConns[net.UDPDestination(net.LocalHostIP, net.Port(1000+maxUDPFlows+9))]
+	handler.RUnlock()
+	if !newest {
+		t.Fatal("the newest flow was the one refused")
 	}
 }
 
-// A flow to port 53 is aged on dnsFlowIdle, not ConnectionIdle: one query, one
+// A flow to port 53 is aged on portIdle[53], not ConnectionIdle: one query, one
 // answer, and the flow is done. Other flows on the same table keep the long
 // timeout.
 func TestDNSFlowIsReapedEarly(t *testing.T) {
-	saved := dnsFlowIdle
-	dnsFlowIdle = 20 * time.Millisecond
-	defer func() { dnsFlowIdle = saved }()
+	saved := portIdle[53]
+	portIdle[53] = 20 * time.Millisecond
+	defer func() { portIdle[53] = saved }()
 
 	handler := newUdpConnectionHandler(func(conn net.Conn, dest net.Destination) {
 		defer conn.Close()
@@ -322,7 +323,7 @@ func TestDNSFlowIsReapedEarly(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("DNS flow was not reaped on dnsFlowIdle")
+			t.Fatal("DNS flow was not reaped on portIdle[53]")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

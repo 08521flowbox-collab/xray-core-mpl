@@ -15,11 +15,22 @@ import (
 
 const maxUDPFlows = 4096
 
-// dnsFlowIdle is the idle timeout for flows to port 53. A DNS exchange is one
-// packet each way; keeping the flow for the general ConnectionIdle (300 s) left
-// a memory-capped host holding hundreds of finished queries, three goroutines
-// and an egress queue each. A var so tests can shrink it.
-var dnsFlowIdle = 10 * time.Second
+// portIdle is the idle timeout for flows whose destination port names a
+// request/response protocol, the same table sing-box keeps as
+// ProtocolTimeouts. A DNS or NTP exchange is one packet each way; keeping the
+// flow for the general ConnectionIdle (300 s) left a memory-capped host
+// holding hundreds of finished queries, three goroutines and an egress queue
+// each. Only ever shortens the general timeout. A var so tests can shrink it.
+var portIdle = map[net.Port]time.Duration{
+	53:   10 * time.Second,
+	123:  10 * time.Second,
+	3478: 10 * time.Second,
+	443:  30 * time.Second,
+}
+
+// egressQueue is how many packets a flow may have waiting for its handler.
+// sing's NAT uses 64; the 1024 upstream chose is 8 KiB of pointers per flow.
+const egressQueue = 64
 
 type packet struct {
 	data []byte
@@ -44,9 +55,15 @@ type udpConnectionHandler struct {
 	stopReap      chan struct{}
 	closeReapOnce sync.Once
 
+	// hijackDNS, when set, answers a query to port 53 without a flow. It runs
+	// after ownPort, and that order is load-bearing: the DNS client's own
+	// upstream query, were it ever to loop back through the tun, would
+	// otherwise be answered by asking the DNS client again, forever.
+	hijackDNS func(src, dst net.Destination, data []byte) bool
+
 	ownPort   func(net.Port) bool
 	loopDrops atomic.Uint64
-	fullDrops atomic.Uint64
+	evictions atomic.Uint64
 }
 
 func newUdpConnectionHandler(handleConnection func(conn net.Conn, dest net.Destination), writePacket func(data []byte, src net.Destination, dst net.Destination) error, idleTimeout time.Duration) *udpConnectionHandler {
@@ -86,20 +103,23 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	}
 	u.RUnlock()
 
+	if u.ownPort(src.Port) {
+		u.dropFlow(&u.loopDrops, "dropped a udp packet that came back into the tun from our own socket", src, dst)
+		return
+	}
+	if dst.Port == 53 && u.hijackDNS != nil && u.hijackDNS(src, dst, data) {
+		return
+	}
+
 	u.Lock()
 	defer u.Unlock()
 
 	conn, found = u.udpConns[src]
 	if !found {
-		if u.ownPort(src.Port) {
-			u.dropFlow(&u.loopDrops, "dropped a udp packet that came back into the tun from our own socket", src, dst)
-			return
-		}
 		if len(u.udpConns) >= maxUDPFlows {
-			u.dropFlow(&u.fullDrops, "dropped a new udp flow: the tun flow table is full", src, dst)
-			return
+			u.evictOldestLocked(src, dst)
 		}
-		egress := make(chan *packet, 1024)
+		egress := make(chan *packet, egressQueue)
 		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst}
 		u.udpConns[src] = conn
 
@@ -125,6 +145,28 @@ func (u *udpConnectionHandler) dropFlow(counter *atomic.Uint64, why string, src,
 	}
 }
 
+// evictOldestLocked makes room for a new flow by closing the one that has
+// gone longest without a packet — an LRU, the way sing's NAT cache is —
+// rather than refusing the newcomer. Caller holds the write lock.
+func (u *udpConnectionHandler) evictOldestLocked(src, dst net.Destination) {
+	var oldestSrc net.Destination
+	var oldest *udpConn
+	for s, c := range u.udpConns {
+		if oldest == nil || c.lastActive.Load() < oldest.lastActive.Load() {
+			oldestSrc, oldest = s, c
+		}
+	}
+	if oldest == nil {
+		return
+	}
+	delete(u.udpConns, oldestSrc)
+	close(oldest.egress)
+	n := u.evictions.Add(1)
+	if n == 1 || n%1000 == 0 {
+		errors.LogWarning(context.Background(), "evicted the oldest udp flow, the tun flow table is full: new flow from ", src.NetAddr(), " to ", dst.NetAddr(), ", evicted ", n)
+	}
+}
+
 // connectionFinished takes the conn and not just its key, and that identity
 // check is load-bearing here in a way it was not upstream. A reaped flow is
 // closed twice — once by reapExpired, then again by handleConnection's own
@@ -144,7 +186,11 @@ func (u *udpConnectionHandler) connectionFinished(src net.Destination, conn *udp
 // only cleanup path that does not depend on a downstream protocol handler
 // noticing a flow went idle.
 func (u *udpConnectionHandler) reapLoop() {
-	interval := min(u.idleTimeout/4, dnsFlowIdle/2)
+	shortest := u.idleTimeout
+	for _, d := range portIdle {
+		shortest = min(shortest, d)
+	}
+	interval := shortest / 4
 	if interval <= 0 {
 		interval = time.Second
 	}
@@ -162,14 +208,13 @@ func (u *udpConnectionHandler) reapLoop() {
 }
 
 func (u *udpConnectionHandler) reapExpired() {
-	now := time.Now()
-	deadline := now.Add(-u.idleTimeout).UnixNano()
-	dnsDeadline := now.Add(-min(u.idleTimeout, dnsFlowIdle)).UnixNano()
+	now := time.Now().UnixNano()
 	u.evict(func(conn *udpConn) bool {
-		if conn.dst.Port == 53 {
-			return conn.lastActive.Load() < dnsDeadline
+		idle := u.idleTimeout
+		if d, ok := portIdle[conn.dst.Port]; ok && d < idle {
+			idle = d
 		}
-		return conn.lastActive.Load() < deadline
+		return conn.lastActive.Load() < now-int64(idle)
 	})
 }
 

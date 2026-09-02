@@ -40,10 +40,65 @@ const (
 // "Reading the Darwin tun through poll and a bare descriptor".
 const waitPollMillis = 100
 
+// rxBatchSize is how many datagrams one recvmsg_x(2) may return. The slots are
+// allocated once and reused; at MTU 4064 that is ~130 KiB held for the life of
+// the tun. See MODIFICATIONS.md, "Reading the Darwin tun in batches".
+const rxBatchSize = 32
+
 type DarwinTun struct {
 	fd      int
 	options TunOptions
 	ownsFd  bool // true for macOS (we created the fd), false for iOS (fd from system)
+	rx      rxBatch
+}
+
+// msgHdrX is struct msghdr_x from <sys/socket.h>: a msghdr followed by the
+// number of bytes the kernel put into (or took from) that message.
+type msgHdrX struct {
+	Msg     unix.Msghdr
+	DataLen uint32
+}
+
+// rxBatch is the receive side of the batching: fixed slots the kernel fills in
+// one recvmsg_x call, handed out one per ReadPacket until the batch is drained.
+type rxBatch struct {
+	slots [][]byte
+	iovs  []unix.Iovec
+	hdrs  []msgHdrX
+	n     int
+	next  int
+}
+
+func newRxBatch(mtu uint32) rxBatch {
+	r := rxBatch{
+		slots: make([][]byte, rxBatchSize),
+		iovs:  make([]unix.Iovec, rxBatchSize),
+		hdrs:  make([]msgHdrX, rxBatchSize),
+	}
+	for i := range r.slots {
+		r.slots[i] = make([]byte, int(mtu)+utunHeaderSize)
+	}
+	return r
+}
+
+// fill issues one non-blocking recvmsg_x and reports how many slots it filled.
+// The headers are rebuilt every call: older kernels reject a msghdr_x whose
+// fields other than the iovec are not zero.
+func (r *rxBatch) fill(fd int) (int, error) {
+	for i := range r.hdrs {
+		r.iovs[i] = unix.Iovec{Base: &r.slots[i][0]}
+		r.iovs[i].SetLen(len(r.slots[i]))
+		r.hdrs[i] = msgHdrX{}
+		r.hdrs[i].Msg.Iov = &r.iovs[i]
+		r.hdrs[i].Msg.Iovlen = 1
+	}
+	n, _, errno := unix.RawSyscall6(unix.SYS_RECVMSG_X, uintptr(fd), uintptr(unsafe.Pointer(&r.hdrs[0])), uintptr(len(r.hdrs)), unix.MSG_DONTWAIT, 0, 0)
+	if errno != 0 {
+		return 0, errno
+	}
+	r.n = int(n)
+	r.next = 0
+	return r.n, nil
 }
 
 var _ Tun = (*DarwinTun)(nil)
@@ -68,6 +123,7 @@ func NewTun(options TunOptions) (Tun, error) {
 			fd:      fd,
 			options: options,
 			ownsFd:  false,
+			rx:      newRxBatch(options.MTU),
 		}, nil
 	}
 
@@ -87,6 +143,7 @@ func NewTun(options TunOptions) (Tun, error) {
 		fd:      fd,
 		options: options,
 		ownsFd:  true,
+		rx:      newRxBatch(options.MTU),
 	}, nil
 }
 
@@ -144,39 +201,41 @@ func (t *DarwinTun) WritePacket(packet *stack.PacketBuffer) tcpip.Error {
 
 // ReadPacket implements GVisorDevice method to read one packet from the tun device
 // It is expected that the method will not block, rather return ErrQueueEmpty when there is nothing on the line,
-// which will make the stack call Wait which should implement desired push-back
+// which will make the stack call Wait which should implement desired push-back.
+// Packets come out of the receive batch; the batch is refilled with one recvmsg_x
+// only once every slot has been handed out. gVisor copies the payload into its
+// own view (buffer.MakeWithData), so the slot is free again as soon as we return.
 func (t *DarwinTun) ReadPacket() (byte, *stack.PacketBuffer, error) {
-	// request memory to write from reusable buffer pool
-	b := buf.NewWithSize(int32(t.options.MTU) + utunHeaderSize)
+	for {
+		if t.rx.next >= t.rx.n {
+			n, err := t.rx.fill(t.fd)
+			if err == unix.EAGAIN || err == unix.EINTR {
+				return 0, nil, ErrQueueEmpty
+			}
+			if err != nil {
+				return 0, nil, err
+			}
+			if n == 0 {
+				return 0, nil, ErrQueueEmpty
+			}
+		}
+		slot := t.rx.next
+		t.rx.next++
+		n := int(t.rx.hdrs[slot].DataLen)
 
-	// read the bytes from the interface descriptor
-	n, err := unix.Read(t.fd, b.Extend(int32(t.options.MTU)+utunHeaderSize))
-	if err == unix.EAGAIN || err == unix.EINTR {
-		b.Release()
-		return 0, nil, ErrQueueEmpty
-	}
-	if err != nil {
-		b.Release()
-		return 0, nil, err
-	}
+		// discard empty or sub-empty packets, but keep draining the batch
+		if n <= utunHeaderSize {
+			continue
+		}
+		data := t.rx.slots[slot][utunHeaderSize:n]
 
-	// discard empty or sub-empty packets
-	if n <= utunHeaderSize {
-		b.Release()
-		return 0, nil, ErrQueueEmpty
+		// network protocol version from first byte of the raw packet, the one that follows Darwin specific header
+		version := data[0] >> 4
+		return version, stack.NewPacketBuffer(stack.PacketBufferOptions{
+			Payload:           buffer.MakeWithData(data),
+			IsForwardedPacket: true,
+		}), nil
 	}
-	b.Resize(0, int32(n))
-
-	// network protocol version from first byte of the raw packet, the one that follows Darwin specific header
-	version := b.Byte(utunHeaderSize) >> 4
-	packetBuffer := buffer.MakeWithData(b.BytesFrom(utunHeaderSize))
-	return version, stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload:           packetBuffer,
-		IsForwardedPacket: true,
-		OnRelease: func() {
-			b.Release()
-		},
-	}), nil
 }
 
 // Wait blocks until the descriptor is readable or waitPollMillis have passed

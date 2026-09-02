@@ -106,6 +106,7 @@ func (t *stackGVisor) Start() error {
 
 	// Use custom UDP packet handler, instead of strict gVisor forwarder, for FullCone NAT support
 	udpForwarder := newUdpConnectionHandler(t.handler.HandleConnection, t.writeRawUDPPacket, t.idleTimeout)
+	udpForwarder.hijackDNS = t.handler.dnsHijack(t.writeRawUDPPacket)
 	t.udpForwarder = udpForwarder
 	ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
 		// DecRef is ours, not upstream's. Clone takes a PacketBuffer out of
