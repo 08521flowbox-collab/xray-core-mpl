@@ -284,3 +284,46 @@ func TestHandlePacketDropsNewFlowsWhenTheTableIsFull(t *testing.T) {
 		t.Fatalf("a packet on an existing flow was dropped: fullDrops = %d", n)
 	}
 }
+
+// A flow to port 53 is aged on dnsFlowIdle, not ConnectionIdle: one query, one
+// answer, and the flow is done. Other flows on the same table keep the long
+// timeout.
+func TestDNSFlowIsReapedEarly(t *testing.T) {
+	saved := dnsFlowIdle
+	dnsFlowIdle = 20 * time.Millisecond
+	defer func() { dnsFlowIdle = saved }()
+
+	handler := newUdpConnectionHandler(func(conn net.Conn, dest net.Destination) {
+		defer conn.Close()
+		buf := make([]byte, 64)
+		for {
+			if _, err := conn.Read(buf); err != nil {
+				return
+			}
+		}
+	}, func([]byte, net.Destination, net.Destination) error { return nil }, time.Hour)
+	defer handler.Close()
+
+	dnsSrc := net.UDPDestination(net.ParseAddress("10.0.0.2"), 40000)
+	otherSrc := net.UDPDestination(net.ParseAddress("10.0.0.2"), 40001)
+	handler.HandlePacket(dnsSrc, net.UDPDestination(net.ParseAddress("1.1.1.1"), 53), []byte("q"))
+	handler.HandlePacket(otherSrc, net.UDPDestination(net.ParseAddress("1.1.1.1"), 443), []byte("q"))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		handler.RLock()
+		_, dnsAlive := handler.udpConns[dnsSrc]
+		_, otherAlive := handler.udpConns[otherSrc]
+		handler.RUnlock()
+		if !dnsAlive {
+			if !otherAlive {
+				t.Fatal("the non-DNS flow was reaped on the DNS timeout")
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("DNS flow was not reaped on dnsFlowIdle")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

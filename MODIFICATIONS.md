@@ -452,6 +452,16 @@ roughly 20 minutes into a "global mode" connection), the next thing to check is 
 `udpConns`'s size and Go's live goroutine count actually grow unboundedly before this patch and
 plateau after it.
 
+### Flows to port 53 age on their own clock (2026-09-03)
+
+Measured on the iOS packet tunnel during a speed test: a goroutine profile taken at 40 MB
+held 198 UDP flows to port 53, three goroutines each, all finished — one query, one answer —
+and all waiting out `ConnectionIdle` (300 s). `reapExpired` now ages a flow whose
+destination port is 53 on `dnsFlowIdle` (10 s, the same number sing-box uses for
+`ProtocolDNS`), and `reapLoop` ticks at `min(idleTimeout/4, dnsFlowIdle/2)` so that clock is
+actually observed. Every other flow keeps `idleTimeout`. `TestDNSFlowIsReapedEarly` pins both
+halves.
+
 ## Adding a `leastlatency` balancer strategy
 
 None of the three upstream strategies answers "put me on the nearest exit":

@@ -15,6 +15,12 @@ import (
 
 const maxUDPFlows = 4096
 
+// dnsFlowIdle is the idle timeout for flows to port 53. A DNS exchange is one
+// packet each way; keeping the flow for the general ConnectionIdle (300 s) left
+// a memory-capped host holding hundreds of finished queries, three goroutines
+// and an egress queue each. A var so tests can shrink it.
+var dnsFlowIdle = 10 * time.Second
+
 type packet struct {
 	data []byte
 	dest *net.Destination
@@ -138,7 +144,7 @@ func (u *udpConnectionHandler) connectionFinished(src net.Destination, conn *udp
 // only cleanup path that does not depend on a downstream protocol handler
 // noticing a flow went idle.
 func (u *udpConnectionHandler) reapLoop() {
-	interval := u.idleTimeout / 4
+	interval := min(u.idleTimeout/4, dnsFlowIdle/2)
 	if interval <= 0 {
 		interval = time.Second
 	}
@@ -156,8 +162,15 @@ func (u *udpConnectionHandler) reapLoop() {
 }
 
 func (u *udpConnectionHandler) reapExpired() {
-	deadline := time.Now().Add(-u.idleTimeout).UnixNano()
-	u.evict(func(conn *udpConn) bool { return conn.lastActive.Load() < deadline })
+	now := time.Now()
+	deadline := now.Add(-u.idleTimeout).UnixNano()
+	dnsDeadline := now.Add(-min(u.idleTimeout, dnsFlowIdle)).UnixNano()
+	u.evict(func(conn *udpConn) bool {
+		if conn.dst.Port == 53 {
+			return conn.lastActive.Load() < dnsDeadline
+		}
+		return conn.lastActive.Load() < deadline
+	})
 }
 
 // Close stops reapLoop and drains what is left. Draining is the half that is
