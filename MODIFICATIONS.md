@@ -539,6 +539,27 @@ NetworkExtension opened for its own utun and we only borrow it:
 | `proxy/tun/stack_gvisor_endpoint.go` | `LinkEndpoint.dispatcherDone`; `Attach`/`Close` go through `stopDispatcher`, which cancels and then waits; the dispatch loop's read-error branch logs and returns rather than re-entering `Attach`. |
 | `proxy/tun/tun_darwin_test.go` | **New.** A `socketpair` stands in for the utun: the injected descriptor is read with its 4-byte family header, written back with one, and `Attach(nil)` returns inside 200 ms with the goroutine gone. |
 
+## Letting the host size the tun's TCP buffers
+
+Not a licence change. `createStack` in `proxy/tun/stack_gvisor.go` gives every TCP endpoint a
+1 MiB send and receive buffer and lets moderate-receive-buffer grow them to 8 MiB / 6 MiB.
+That is the right default for a desktop or an Android service. It is fatal inside an iOS
+packet tunnel, which jetsam kills at 50 MB: measured 2026-09-02, a fast.com run over the
+defaults took the extension from 15 MB idle to 40 MB and the kernel ended it before the
+test finished.
+
+Two environment flags, read once when the stack is built, in the same style as
+`xray.tun.fd`:
+
+| Flag | Meaning |
+|---|---|
+| `xray.tun.tcp.bufdefault` | bytes; replaces the Default of both buffer ranges |
+| `xray.tun.tcp.bufmax` | bytes; replaces the Max of both buffer ranges |
+
+Unset means the constants above, so no existing caller changes. The consumer sets them from
+its own tunnel settings just before adding the tun inbound (`zapsplit-libzapcore`'s
+`TUNSettings.TCPBufferKB` / `TCPBufferMaxKB`).
+
 ## Verifying the result
 
 ```sh

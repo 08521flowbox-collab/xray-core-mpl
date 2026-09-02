@@ -24,6 +24,11 @@ const (
 	XUDPBaseKey          = "xray.xudp.basekey"
 
 	TunFdKey = "xray.tun.fd"
+	// TunTCPBufDefaultKey and TunTCPBufMaxKey override the gVisor TCP buffer
+	// sizes (bytes, applied to both directions) for hosts with a hard memory
+	// cap; unset keeps the stack defaults. See proxy/tun/stack_gvisor.go.
+	TunTCPBufDefaultKey = "xray.tun.tcp.bufdefault"
+	TunTCPBufMaxKey     = "xray.tun.tcp.bufmax"
 
 	MphCachePath = "xray.mph.cache"
 )

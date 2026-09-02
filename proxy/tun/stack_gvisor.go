@@ -6,6 +6,7 @@ import (
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/platform"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -260,10 +261,22 @@ func createStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
 	rOpt := tcpip.TCPRecovery(0)
 	gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &rOpt)
 
+	// A host with a hard memory cap (the iOS packet tunnel's 50 MB) trades
+	// per-connection throughput for headroom here; everyone else keeps the
+	// defaults. Measured 2026-09-02: fast.com over the defaults took the
+	// extension to 40 MB and jetsam.
+	rxDef := platform.NewEnvFlag(platform.TunTCPBufDefaultKey).GetValueAsInt(tcpRXBufDefSize)
+	rxMax := platform.NewEnvFlag(platform.TunTCPBufMaxKey).GetValueAsInt(tcpRXBufMaxSize)
+	txDef := platform.NewEnvFlag(platform.TunTCPBufDefaultKey).GetValueAsInt(tcpTXBufDefSize)
+	txMax := platform.NewEnvFlag(platform.TunTCPBufMaxKey).GetValueAsInt(tcpTXBufMaxSize)
+	if rxDef != tcpRXBufDefSize || rxMax != tcpRXBufMaxSize {
+		errors.LogInfo(context.Background(), "tun: tcp buffers default=", rxDef, " max=", rxMax)
+	}
+
 	tcpRXBufOpt := tcpip.TCPReceiveBufferSizeRangeOption{
 		Min:     tcpRXBufMinSize,
-		Default: tcpRXBufDefSize,
-		Max:     tcpRXBufMaxSize,
+		Default: rxDef,
+		Max:     rxMax,
 	}
 	err = gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRXBufOpt)
 	if err != nil {
@@ -272,8 +285,8 @@ func createStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
 
 	tcpTXBufOpt := tcpip.TCPSendBufferSizeRangeOption{
 		Min:     tcpTXBufMinSize,
-		Default: tcpTXBufDefSize,
-		Max:     tcpTXBufMaxSize,
+		Default: txDef,
+		Max:     txMax,
 	}
 	err = gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpTXBufOpt)
 	if err != nil {
