@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	xerrors "github.com/xtls/xray-core/common/errors"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -24,6 +25,7 @@ type LinkEndpoint struct {
 	deviceMTU        uint32
 	device           GVisorDevice
 	dispatcherCancel context.CancelFunc
+	dispatcherDone   chan struct{}
 }
 
 func (e *LinkEndpoint) MTU() uint32 {
@@ -50,17 +52,29 @@ func (e *LinkEndpoint) Capabilities() stack.LinkEndpointCapabilities {
 	return stack.CapabilityRXChecksumOffload
 }
 
+// Attach starts the dispatch loop, or with a nil dispatcher stops it and
+// returns only once the loop has left ReadPacket/Wait for good — the caller
+// closes the descriptor next, and on Darwin that descriptor may not even be
+// ours to close (see tun_darwin.go).
 func (e *LinkEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
-	if e.dispatcherCancel != nil {
-		e.dispatcherCancel()
-		e.dispatcherCancel = nil
-	}
+	e.stopDispatcher()
 
 	if dispatcher != nil {
 		ctx, cancel := context.WithCancel(context.Background())
-		go e.dispatchLoop(ctx, dispatcher)
 		e.dispatcherCancel = cancel
+		e.dispatcherDone = make(chan struct{})
+		go e.dispatchLoop(ctx, dispatcher, e.dispatcherDone)
 	}
+}
+
+func (e *LinkEndpoint) stopDispatcher() {
+	if e.dispatcherCancel == nil {
+		return
+	}
+	e.dispatcherCancel()
+	e.dispatcherCancel = nil
+	<-e.dispatcherDone
+	e.dispatcherDone = nil
 }
 
 func (e *LinkEndpoint) IsAttached() bool {
@@ -84,10 +98,7 @@ func (e *LinkEndpoint) ParseHeader(ptr *stack.PacketBuffer) bool {
 }
 
 func (e *LinkEndpoint) Close() {
-	if e.dispatcherCancel != nil {
-		e.dispatcherCancel()
-		e.dispatcherCancel = nil
-	}
+	e.stopDispatcher()
 }
 
 func (e *LinkEndpoint) SetOnCloseAction(_ func()) {
@@ -109,7 +120,8 @@ func (e *LinkEndpoint) WritePackets(packetBufferList stack.PacketBufferList) (in
 	return n, nil
 }
 
-func (e *LinkEndpoint) dispatchLoop(ctx context.Context, dispatcher stack.NetworkDispatcher) {
+func (e *LinkEndpoint) dispatchLoop(ctx context.Context, dispatcher stack.NetworkDispatcher, done chan struct{}) {
+	defer close(done)
 	var networkProtocolNumber tcpip.NetworkProtocolNumber
 	var version byte
 	var packet *stack.PacketBuffer
@@ -126,9 +138,10 @@ func (e *LinkEndpoint) dispatchLoop(ctx context.Context, dispatcher stack.Networ
 				e.device.Wait()
 				continue
 			}
-			// stop dispatcher loop on any other interface failure
+			// stop dispatcher loop on any other interface failure; Attach(nil)
+			// would wait for this very goroutine, so only log and leave
 			if err != nil {
-				e.Attach(nil)
+				xerrors.LogWarning(ctx, "tun dispatch loop stopped: ", err)
 				return
 			}
 

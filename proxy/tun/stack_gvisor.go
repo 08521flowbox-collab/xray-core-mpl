@@ -205,7 +205,8 @@ func (t *stackGVisor) Close() error {
 	}
 	t.endpoint.Attach(nil)
 	// Drained after Attach(nil), not before: that call stops the inbound
-	// dispatchers and Waits for them to leave dispatchLoop, so once it returns
+	// dispatchers and waits for them to leave dispatchLoop (fdbased does it in
+	// its own Attach; ours in LinkEndpoint.stopDispatcher), so once it returns
 	// nothing can deliver another packet and put a flow back into the table
 	// behind the drain. Draining first would leave whatever arrived in the gap
 	// with no reaper left to collect it.

@@ -34,11 +34,14 @@ const (
 	ND6_INFINITE_LIFETIME = 0xFFFFFFFF // netinet6/nd6.h
 )
 
-//go:linkname procyield runtime.procyield
-func procyield(cycles uint32)
+// waitPollMillis bounds how long ReadPacket's caller sits in poll(2) between
+// looks at the descriptor; it is also the upper bound on how long Attach(nil)
+// waits for the dispatch loop to notice it was cancelled. See MODIFICATIONS.md,
+// "Reading the Darwin tun through poll and a bare descriptor".
+const waitPollMillis = 100
 
 type DarwinTun struct {
-	tunFile *os.File
+	fd      int
 	options TunOptions
 	ownsFd  bool // true for macOS (we created the fd), false for iOS (fd from system)
 }
@@ -62,26 +65,26 @@ func NewTun(options TunOptions) (Tun, error) {
 		}
 
 		return &DarwinTun{
-			tunFile: os.NewFile(uintptr(fd), "utun"),
+			fd:      fd,
 			options: options,
 			ownsFd:  false,
 		}, nil
 	}
 
 	// macOS: create our own utun interface
-	tunFile, err := open(options.Name)
+	fd, err := open(options.Name)
 	if err != nil {
 		return nil, err
 	}
 
 	err = setup(options.Name, options.MTU)
 	if err != nil {
-		_ = tunFile.Close()
+		_ = unix.Close(fd)
 		return nil, err
 	}
 
 	return &DarwinTun{
-		tunFile: tunFile,
+		fd:      fd,
 		options: options,
 		ownsFd:  true,
 	}, nil
@@ -93,7 +96,7 @@ func (t *DarwinTun) Start() error {
 
 func (t *DarwinTun) Close() error {
 	if t.ownsFd {
-		return t.tunFile.Close()
+		return unix.Close(t.fd)
 	}
 	// iOS: don't close the fd, it's owned by NetworkExtension
 	return nil
@@ -123,8 +126,15 @@ func (t *DarwinTun) WritePacket(packet *stack.PacketBuffer) tcpip.Error {
 	}
 	b.SetByte(3, family)
 
-	if _, err := t.tunFile.Write(b.Bytes()); err != nil {
-		if errors.Is(err, unix.EAGAIN) {
+	_, err := unix.Write(t.fd, b.Bytes())
+	if err == unix.EAGAIN {
+		// os.File used to park in the runtime poller until the descriptor was
+		// writable; a bare descriptor has to do that itself, once.
+		_, _ = unix.Poll([]unix.PollFd{{Fd: int32(t.fd), Events: unix.POLLOUT}}, 10)
+		_, err = unix.Write(t.fd, b.Bytes())
+	}
+	if err != nil {
+		if err == unix.EAGAIN {
 			return &tcpip.ErrWouldBlock{}
 		}
 		return &tcpip.ErrAborted{}
@@ -139,9 +149,9 @@ func (t *DarwinTun) ReadPacket() (byte, *stack.PacketBuffer, error) {
 	// request memory to write from reusable buffer pool
 	b := buf.NewWithSize(int32(t.options.MTU) + utunHeaderSize)
 
-	// read the bytes to the interface file
-	n, err := b.ReadFrom(t.tunFile)
-	if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) {
+	// read the bytes from the interface descriptor
+	n, err := unix.Read(t.fd, b.Extend(int32(t.options.MTU)+utunHeaderSize))
+	if err == unix.EAGAIN || err == unix.EINTR {
 		b.Release()
 		return 0, nil, ErrQueueEmpty
 	}
@@ -155,6 +165,7 @@ func (t *DarwinTun) ReadPacket() (byte, *stack.PacketBuffer, error) {
 		b.Release()
 		return 0, nil, ErrQueueEmpty
 	}
+	b.Resize(0, int32(n))
 
 	// network protocol version from first byte of the raw packet, the one that follows Darwin specific header
 	version := b.Byte(utunHeaderSize) >> 4
@@ -168,9 +179,9 @@ func (t *DarwinTun) ReadPacket() (byte, *stack.PacketBuffer, error) {
 	}), nil
 }
 
-// Wait some cpu cycles
+// Wait blocks until the descriptor is readable or waitPollMillis have passed
 func (t *DarwinTun) Wait() {
-	procyield(1)
+	_, _ = unix.Poll([]unix.PollFd{{Fd: int32(t.fd), Events: unix.POLLIN}}, waitPollMillis)
 }
 
 func (t *DarwinTun) newEndpoint() (stack.LinkEndpoint, error) {
@@ -178,23 +189,23 @@ func (t *DarwinTun) newEndpoint() (stack.LinkEndpoint, error) {
 }
 
 // open the interface, by creating new utunN if in the system and returning its file descriptor
-func open(name string) (*os.File, error) {
+func open(name string) (int, error) {
 	ifIndex := -1
 	_, err := fmt.Sscanf(name, "utun%d", &ifIndex)
 	if err != nil || ifIndex < 0 {
-		return nil, errors.New("interface name must be utunN, where N is a number, e.g. utun9, utun11 and so on")
+		return -1, errors.New("interface name must be utunN, where N is a number, e.g. utun9, utun11 and so on")
 	}
 
 	fd, err := unix.Socket(unix.AF_SYSTEM, unix.SOCK_DGRAM, sysprotoControl)
 	if err != nil {
-		return nil, err
+		return -1, err
 	}
 
 	ctlInfo := &unix.CtlInfo{}
 	copy(ctlInfo.Name[:], utunControlName)
 	if err := unix.IoctlCtlInfo(fd, ctlInfo); err != nil {
 		_ = unix.Close(fd)
-		return nil, err
+		return -1, err
 	}
 
 	sockaddr := &unix.SockaddrCtl{
@@ -203,15 +214,15 @@ func open(name string) (*os.File, error) {
 	}
 	if err := unix.Connect(fd, sockaddr); err != nil {
 		_ = unix.Close(fd)
-		return nil, err
+		return -1, err
 	}
 
 	if err := unix.SetNonblock(fd, true); err != nil {
 		_ = unix.Close(fd)
-		return nil, err
+		return -1, err
 	}
 
-	return os.NewFile(uintptr(fd), name), nil
+	return fd, nil
 }
 
 // setup the interface by name

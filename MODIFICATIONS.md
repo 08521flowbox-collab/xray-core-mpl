@@ -508,6 +508,37 @@ the tun from our own socket` line in a service log is the confirmation; the fami
 meant to make sure that line never appears. If it does appear after this patch, the binding is
 not the cause and the capture is the next step.
 
+## Reading the Darwin tun through poll and a bare descriptor
+
+Not a licence change. Three reasons, all of them iOS, where the descriptor is the one
+NetworkExtension opened for its own utun and we only borrow it:
+
+- `tun_darwin.go` wrapped the injected descriptor in `os.NewFile`. An `os.File` carries a
+  finalizer, so once `DetachTun` had dropped the `DarwinTun` the next GC closed the
+  extension's utun behind its back, at a moment nobody chose. The Android tun holds a bare
+  `int` for the same reason; Darwin now does too, and `Close` only closes what `open()` created
+  (`ownsFd`).
+- The stack's own `LinkEndpoint.Attach(nil)` cancelled the dispatch loop's context and
+  returned. It never waited for `dispatchLoop` to leave `ReadPacket`, so the comment in
+  `stackGVisor.Close` ("stops the inbound dispatchers and Waits for them to leave
+  dispatchLoop") described gVisor's `fdbased` endpoint, not ours: the descriptor was handed
+  back while a goroutine was still reading it. `Attach(nil)` now blocks on a `done` channel
+  the loop closes on exit. The loop's own error branch used to call `Attach(nil)` on itself,
+  which would now be a deadlock; it logs and returns instead.
+- With no `os.File` there is no runtime poller, so `Wait` is `poll(2)` with `POLLIN` and a
+  100 ms timeout. That number is the upper bound on how long `Attach(nil)` waits — the loop
+  only checks its context between reads — and on macOS it measured 44 ms for `DetachTun`
+  against 60 µs before (which was fast because it did not wait at all; the goroutine only
+  died at `Stop`). Idle CPU with the tun attached went from 0.06% to 0.26% over 30 s.
+  `WritePacket` polls once for `POLLOUT` on `EAGAIN`, which is the blocking the `os.File`
+  write used to do for it.
+
+| File | Change |
+|---|---|
+| `proxy/tun/tun_darwin.go` | `DarwinTun.fd int` instead of `*os.File`; `unix.Read`/`unix.Write` with `EAGAIN`→`ErrQueueEmpty`/`ErrWouldBlock`; `Wait` is `unix.Poll(POLLIN, 100ms)`; the `procyield` linkname is gone; `open` returns the raw descriptor. |
+| `proxy/tun/stack_gvisor_endpoint.go` | `LinkEndpoint.dispatcherDone`; `Attach`/`Close` go through `stopDispatcher`, which cancels and then waits; the dispatch loop's read-error branch logs and returns rather than re-entering `Attach`. |
+| `proxy/tun/tun_darwin_test.go` | **New.** A `socketpair` stands in for the utun: the injected descriptor is read with its 4-byte family header, written back with one, and `Attach(nil)` returns inside 200 ms with the goroutine gone. |
+
 ## Verifying the result
 
 ```sh
