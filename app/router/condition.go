@@ -54,6 +54,7 @@ var matcherTypeMap = map[Domain_Type]strmatcher.Type{
 
 type DomainMatcher struct {
 	Matchers strmatcher.IndexMatcher
+	Set      *strmatcher.DomainSet
 }
 
 func SerializeDomainMatcher(domains []*Domain, w io.Writer) error {
@@ -83,14 +84,36 @@ func NewDomainMatcherFromBuffer(data []byte) (*strmatcher.MphMatcherGroup, error
 	return matcher, nil
 }
 
+// NewMphMatcherGroup builds the matcher for a rule's domain list. Suffix and
+// full rules, which are all a geosite entry is made of, go into a succinct
+// DomainSet; only substring and regex rules build the MPH group.
 func NewMphMatcherGroup(domains []*Domain) (*DomainMatcher, error) {
-	g := strmatcher.NewMphMatcherGroup()
+	var full, suffix []string
+	others := make([]*Domain, 0, len(domains))
 	for i, d := range domains {
 		domains[i] = nil
+		switch d.Type {
+		case Domain_Full:
+			full = append(full, d.Value)
+		case Domain_Domain:
+			suffix = append(suffix, d.Value)
+		default:
+			others = append(others, d)
+		}
+	}
+	return buildDomainMatcher(full, suffix, others), nil
+}
+
+func buildDomainMatcher(full, suffix []string, others []*Domain) *DomainMatcher {
+	var g *strmatcher.MphMatcherGroup
+	for _, d := range others {
 		matcherType, f := matcherTypeMap[d.Type]
 		if !f {
 			errors.LogError(context.Background(), "ignore unsupported domain type ", d.Type, " of rule ", d.Value)
 			continue
+		}
+		if g == nil {
+			g = strmatcher.NewMphMatcherGroup()
 		}
 		_, err := g.AddPattern(d.Value, matcherType)
 		if err != nil {
@@ -98,14 +121,23 @@ func NewMphMatcherGroup(domains []*Domain) (*DomainMatcher, error) {
 			continue
 		}
 	}
-	g.Build()
-	return &DomainMatcher{
-		Matchers: g,
-	}, nil
+	m := &DomainMatcher{}
+	if len(full)+len(suffix) > 0 {
+		m.Set = strmatcher.NewDomainSet(full, suffix)
+	}
+	if g != nil {
+		g.Build()
+		m.Matchers = g
+	}
+	return m
 }
 
 func (m *DomainMatcher) ApplyDomain(domain string) bool {
-	return len(m.Matchers.Match(strings.ToLower(domain))) > 0
+	domain = strings.ToLower(domain)
+	if m.Set != nil && m.Set.Match(domain) {
+		return true
+	}
+	return m.Matchers != nil && len(m.Matchers.Match(domain)) > 0
 }
 
 // Apply implements Condition.

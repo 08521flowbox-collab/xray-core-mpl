@@ -60,6 +60,10 @@ func (rr *RoutingRule) BuildCondition() (Condition, error) {
 		conds.Add(NewPortMatcher(rr.LocalPortList, MatcherAsType_Local))
 	}
 
+	if c := prebuiltCondition(rr.RuleTag); c != nil {
+		conds.Add(c)
+	}
+
 	if rr.VlessRouteList != nil {
 		conds.Add(NewPortMatcher(rr.VlessRouteList, MatcherAsType_VlessRoute))
 	}

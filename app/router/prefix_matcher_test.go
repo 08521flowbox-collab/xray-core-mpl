@@ -1,0 +1,76 @@
+package router_test
+
+import (
+	"net/netip"
+	"testing"
+
+	. "github.com/xtls/xray-core/app/router"
+	"github.com/xtls/xray-core/common/net"
+)
+
+func ip(s string) net.IP { return net.ParseAddress(s).IP() }
+
+func TestPrefixSetMatcher(t *testing.T) {
+	m := NewPrefixSetMatcher([]netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("10.1.0.0/16"),
+		netip.MustParsePrefix("192.168.1.5/24"),
+		netip.MustParsePrefix("192.168.2.0/24"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	}, false)
+	if m.Len() != 3 {
+		t.Fatalf("Len=%d want 3 merged ranges", m.Len())
+	}
+	cases := map[string]bool{
+		"10.200.3.4":      true,
+		"11.0.0.0":        false,
+		"9.255.255.255":   false,
+		"192.168.1.0":     true,
+		"192.168.2.255":   true,
+		"192.168.3.0":     false,
+		"2001:db8::1":     false,
+		"::ffff:10.0.0.1": true,
+	}
+	for s, want := range cases {
+		if got := m.Match(ip(s)); got != want {
+			t.Errorf("Match(%s)=%v want %v", s, got, want)
+		}
+	}
+	m.SetReverse(true)
+	if m.Match(ip("10.0.0.1")) || !m.Match(ip("11.0.0.1")) {
+		t.Error("reverse did not flip the answer")
+	}
+	m.ToggleReverse()
+	if !m.Matches([]net.IP{ip("10.0.0.1"), ip("192.168.2.1")}) {
+		t.Error("Matches should be true when every address is inside")
+	}
+	if m.Matches([]net.IP{ip("10.0.0.1"), ip("8.8.8.8")}) {
+		t.Error("Matches should be false when one address is outside")
+	}
+	if !m.AnyMatch([]net.IP{ip("8.8.8.8"), ip("10.0.0.1")}) {
+		t.Error("AnyMatch missed")
+	}
+	in, out := m.FilterIPs([]net.IP{ip("10.0.0.1"), ip("8.8.8.8")})
+	if len(in) != 1 || len(out) != 1 {
+		t.Errorf("FilterIPs split %d/%d", len(in), len(out))
+	}
+}
+
+func TestPrefixSetMatcherWholeSpace(t *testing.T) {
+	m := NewPrefixSetMatcher([]netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}, false)
+	for _, s := range []string{"0.0.0.0", "255.255.255.255", "127.0.0.1"} {
+		if !m.Match(ip(s)) {
+			t.Errorf("%s not matched by the whole space", s)
+		}
+	}
+}
+
+func TestNewPrefixIPMatcherIncludeAndExclude(t *testing.T) {
+	m, err := NewPrefixIPMatcher([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}, MatcherAsType_Target)
+	if err != nil || m == nil {
+		t.Fatalf("matcher %v err %v", m, err)
+	}
+	if _, err := NewPrefixIPMatcher(nil, nil, MatcherAsType_Target); err == nil {
+		t.Error("empty lists accepted")
+	}
+}
