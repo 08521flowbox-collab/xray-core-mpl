@@ -18,6 +18,14 @@ import (
 )
 
 const (
+	// cacheCapacity caps the records one nameserver keeps. Upstream only ages
+	// records out by TTL, so a long browsing session on a memory-capped process
+	// grows the map without bound; sing-box's DNS cache is an LRU with a
+	// capacity for the same reason. Over capacity, updateRecord drops the
+	// soonest-to-expire of a small random sample (Go's map iteration order),
+	// which is an approximate LRU at O(sample) cost.
+	cacheCapacity           = 2048
+	evictSample             = 16
 	minSizeForEmptyRebuild  = 512
 	shrinkAbsoluteThreshold = 10240
 	shrinkRatioThreshold    = 0.65
@@ -37,7 +45,44 @@ type CacheController struct {
 	pub           *pubsub.Service
 	cacheCleanup  *task.Periodic
 	highWatermark int
+	evictions     uint64
 	requestGroup  singleflight.Group
+}
+
+func (r *record) expire() time.Time {
+	var t time.Time
+	if r.A != nil {
+		t = r.A.Expire
+	}
+	if r.AAAA != nil && (t.IsZero() || r.AAAA.Expire.Before(t)) {
+		t = r.AAAA.Expire
+	}
+	return t
+}
+
+// evictLocked keeps the map at cacheCapacity; the caller holds the write lock.
+func (c *CacheController) evictLocked() {
+	if len(c.ips) <= cacheCapacity {
+		return
+	}
+	var victim string
+	var victimExpire time.Time
+	n := 0
+	for domain, rec := range c.ips {
+		exp := rec.expire()
+		if n == 0 || exp.Before(victimExpire) {
+			victim, victimExpire = domain, exp
+		}
+		n++
+		if n >= evictSample {
+			break
+		}
+	}
+	delete(c.ips, victim)
+	c.evictions++
+	if c.evictions == 1 || c.evictions%1000 == 0 {
+		errors.LogInfo(context.Background(), c.name, " cache at capacity ", cacheCapacity, ": evicted ", victim, " (", c.evictions, " so far)")
+	}
 }
 
 func NewCacheController(name string, disableCache bool, serveStale bool, serveExpiredTTL uint32) *CacheController {
@@ -291,6 +336,7 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 	}
 
 	c.ips[req.domain] = newRec
+	c.evictLocked()
 	c.Unlock()
 
 	if pubRecord != nil {

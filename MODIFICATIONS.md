@@ -604,6 +604,23 @@ The write side is unchanged. `sendmsg_x` is behind an experimental flag in sing-
 | `proxy/tun/tun_darwin.go` | `msgHdrX`, `rxBatch`, `newRxBatch`, `rxBatch.fill` (one `RawSyscall6(SYS_RECVMSG_X, …, MSG_DONTWAIT)`); `ReadPacket` drains the batch. |
 | `proxy/tun/tun_darwin_test.go` | Six datagrams on the socketpair land in one `recvmsg_x`, header-only ones are skipped, and a packet's bytes survive the slot being refilled. |
 
+## Bounding the tun's in-flight TCP handshakes
+
+Not a licence change. `tcp.NewForwarder`'s third argument is how many half-open handshakes
+the stack keeps at once; each is a gVisor endpoint until the peer's ACK or a timeout. The
+fork passed 65535, sing-tun passes 1024, and on a memory-capped process that bound is the
+only thing between a connection burst and the jetsam line. `maxInFlightHandshakes = 1024` in
+`proxy/tun/stack_gvisor.go`.
+
+## Capping the DNS cache
+
+Not a licence change. `app/dns/cache_controller.go` only aged records out by TTL, so a long
+session grew `ips` without bound; sing-box's DNS cache is an LRU with a capacity. `updateRecord`
+now calls `evictLocked` after every insert: over `cacheCapacity` (2048) it drops the
+soonest-to-expire record among `evictSample` (16) entries of a map walk — Go's iteration
+order is random, so this is an approximate LRU at O(16). `evictions` is logged on the first
+and every thousandth. `TestCacheStaysAtCapacity` pins the size.
+
 ## Letting the host size the tun's TCP buffers
 
 Not a licence change. `createStack` in `proxy/tun/stack_gvisor.go` gives every TCP endpoint a
