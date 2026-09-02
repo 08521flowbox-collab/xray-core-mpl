@@ -209,3 +209,78 @@ func TestHandlePacketDoesNotPanicRacingReap(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestHandlePacketDropsAFlowThatCameFromOurOwnSocket(t *testing.T) {
+	handled := make(chan net.Destination, 2)
+	handler := newUdpConnectionHandler(
+		func(conn net.Conn, dest net.Destination) {
+			handled <- net.DestinationFromAddr(conn.RemoteAddr())
+		},
+		func(data []byte, src net.Destination, dst net.Destination) error { return nil },
+		time.Second,
+	)
+	defer handler.Close()
+	handler.ownPort = func(port net.Port) bool { return port == 40000 }
+
+	dst := net.UDPDestination(net.LocalHostIP, 123)
+	looped := net.UDPDestination(net.LocalHostIP, 40000)
+	foreign := net.UDPDestination(net.LocalHostIP, 40001)
+	handler.HandlePacket(looped, dst, []byte{1})
+	handler.HandlePacket(foreign, dst, []byte{1})
+
+	select {
+	case got := <-handled:
+		if got != foreign {
+			t.Fatalf("handled %v, expected only %v", got, foreign)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the flow from a foreign port was not handled")
+	}
+
+	handler.RLock()
+	_, found := handler.udpConns[looped]
+	flows := len(handler.udpConns)
+	handler.RUnlock()
+	if found || flows != 1 {
+		t.Fatalf("looped flow present=%v, flows=%d", found, flows)
+	}
+	if n := handler.loopDrops.Load(); n != 1 {
+		t.Fatalf("loopDrops = %d, expected 1", n)
+	}
+}
+
+func TestHandlePacketDropsNewFlowsWhenTheTableIsFull(t *testing.T) {
+	handler := newUdpConnectionHandler(
+		func(conn net.Conn, dest net.Destination) {
+			buf := make([]byte, 1)
+			for {
+				if _, err := conn.Read(buf); err != nil {
+					return
+				}
+			}
+		},
+		func(data []byte, src net.Destination, dst net.Destination) error { return nil },
+		time.Second,
+	)
+	defer handler.Close()
+
+	dst := net.UDPDestination(net.LocalHostIP, 123)
+	for i := 0; i < maxUDPFlows+10; i++ {
+		handler.HandlePacket(net.UDPDestination(net.LocalHostIP, net.Port(1000+i)), dst, []byte{1})
+	}
+
+	handler.RLock()
+	flows := len(handler.udpConns)
+	handler.RUnlock()
+	if flows != maxUDPFlows {
+		t.Fatalf("flows = %d, expected %d", flows, maxUDPFlows)
+	}
+	if n := handler.fullDrops.Load(); n != 10 {
+		t.Fatalf("fullDrops = %d, expected 10", n)
+	}
+
+	handler.HandlePacket(net.UDPDestination(net.LocalHostIP, 1000), dst, []byte{2})
+	if n := handler.fullDrops.Load(); n != 10 {
+		t.Fatalf("a packet on an existing flow was dropped: fullDrops = %d", n)
+	}
+}

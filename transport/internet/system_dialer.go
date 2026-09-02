@@ -51,18 +51,12 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 	errors.LogDebug(ctx, "dialing to "+dest.String())
 
 	if dest.Network == net.Network_UDP && !hasBindAddr(sockopt) {
-		srcAddr := resolveSrcAddr(net.Network_UDP, src)
-		if srcAddr == nil {
-			srcAddr = &net.UDPAddr{
-				IP:   []byte{0, 0, 0, 0},
-				Port: 0,
-			}
-		}
-		var lc net.ListenConfig
 		destAddr, err := net.ResolveUDPAddr("udp", dest.NetAddr())
 		if err != nil {
 			return nil, err
 		}
+		network, srcAddr := udpListenAddr(resolveSrcAddr(net.Network_UDP, src), destAddr)
+		var lc net.ListenConfig
 		lc.Control = func(network, address string, c syscall.RawConn) error {
 			for _, ctl := range d.controllers {
 				if err := ctl(network, address, c); err != nil {
@@ -83,13 +77,15 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 				}
 			})
 		}
-		packetConn, err := lc.ListenPacket(ctx, srcAddr.Network(), srcAddr.String())
+		packetConn, err := lc.ListenPacket(ctx, network, srcAddr.String())
 		if err != nil {
 			return nil, err
 		}
+		noteOwnUDPPort(packetConn)
 		return &PacketConnWrapper{
 			PacketConn: packetConn,
 			Dest:       destAddr,
+			owned:      packetConn,
 		}, nil
 	}
 	// Chrome defaults
@@ -158,7 +154,8 @@ func (d *DefaultSystemDialer) DestIpAddress() net.IP {
 
 type PacketConnWrapper struct {
 	net.PacketConn
-	Dest net.Addr
+	Dest  net.Addr
+	owned net.PacketConn
 }
 
 func (c *PacketConnWrapper) Read(p []byte) (int, error) {
@@ -172,6 +169,13 @@ func (c *PacketConnWrapper) Write(p []byte) (int, error) {
 
 func (c *PacketConnWrapper) RemoteAddr() net.Addr {
 	return c.Dest
+}
+
+func (c *PacketConnWrapper) Close() error {
+	if c.owned != nil {
+		forgetOwnUDPPort(c.owned)
+	}
+	return c.PacketConn.Close()
 }
 
 type SystemDialerAdapter interface {

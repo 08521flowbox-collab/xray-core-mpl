@@ -10,7 +10,10 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/transport/internet"
 )
+
+const maxUDPFlows = 4096
 
 type packet struct {
 	data []byte
@@ -34,6 +37,10 @@ type udpConnectionHandler struct {
 	idleTimeout   time.Duration
 	stopReap      chan struct{}
 	closeReapOnce sync.Once
+
+	ownPort   func(net.Port) bool
+	loopDrops atomic.Uint64
+	fullDrops atomic.Uint64
 }
 
 func newUdpConnectionHandler(handleConnection func(conn net.Conn, dest net.Destination), writePacket func(data []byte, src net.Destination, dst net.Destination) error, idleTimeout time.Duration) *udpConnectionHandler {
@@ -43,6 +50,7 @@ func newUdpConnectionHandler(handleConnection func(conn net.Conn, dest net.Desti
 		writePacket:      writePacket,
 		idleTimeout:      idleTimeout,
 		stopReap:         make(chan struct{}),
+		ownPort:          internet.IsOwnUDPPort,
 	}
 
 	if idleTimeout > 0 {
@@ -77,6 +85,14 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 
 	conn, found = u.udpConns[src]
 	if !found {
+		if u.ownPort(src.Port) {
+			u.dropFlow(&u.loopDrops, "dropped a udp packet that came back into the tun from our own socket", src, dst)
+			return
+		}
+		if len(u.udpConns) >= maxUDPFlows {
+			u.dropFlow(&u.fullDrops, "dropped a new udp flow: the tun flow table is full", src, dst)
+			return
+		}
 		egress := make(chan *packet, 1024)
 		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst}
 		u.udpConns[src] = conn
@@ -93,6 +109,13 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	}:
 	default:
 		errors.LogDebug(context.Background(), "drop udp with size ", len(data), " to ", dst.NetAddr(), " original ", conn.dst.NetAddr(), " > queue full")
+	}
+}
+
+func (u *udpConnectionHandler) dropFlow(counter *atomic.Uint64, why string, src, dst net.Destination) {
+	n := counter.Add(1)
+	if n == 1 || n%1000 == 0 {
+		errors.LogWarning(context.Background(), why, ": from ", src.NetAddr(), " to ", dst.NetAddr(), ", flows ", len(u.udpConns), ", dropped ", n)
 	}
 }
 

@@ -146,7 +146,7 @@ func (w *fileLogWriter) Close() error {
 func CreateStdoutLogWriter() WriterCreator {
 	return func() Writer {
 		return &consoleLogWriter{
-			logger: log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lmicroseconds),
+			logger: log.New(log.Writer(), log.Prefix(), log.Flags()),
 		}
 	}
 }

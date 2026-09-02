@@ -474,6 +474,40 @@ None of the three upstream strategies answers "put me on the nearest exit":
 two lines. Everything else — `Expected`, `Baselines`, `MaxRTT`, the cost ladder, `FallbackTag`
 — works identically under both names.
 
+## Keeping the tun from eating the direct outbound's own UDP
+
+Not a licence change. Reasoned from two crash dumps of the Windows service (2026-09-02), not
+yet measured against a packet capture — see the caveat at the end.
+
+Both dumps are the Go runtime's `thread exhaustion` (the 10000-thread cap), about six minutes
+after `tunnel up`. Each holds ~32k tun UDP flows, **every one of them IPv4 to port 123**, all
+created in the first ~90 s of the session and all mid-`Close` at the moment of death: the
+reaper above had just evicted the whole batch at once, ~5.7k goroutines were inside Windows'
+`closesocket`, the rest were waiting on `CancelIoEx`, and sysmon minted a thread for each
+blocked syscall until the cap. The shape — one flow per hop, a fresh source port per hop,
+starting the instant the adapter exists (Windows Time re-syncs on a network change) — is what
+the direct outbound's UDP sends re-entering the tun would look like. The direct UDP socket is
+`ListenPacket("udp", "0.0.0.0:0")`, which Go builds as a dual-stack AF_INET6 socket; the
+consumer pins it to the physical adapter with `IP_UNICAST_IF` + `IPV6_UNICAST_IF`, and whether
+Windows honours the IPv4 one for v4-mapped traffic on a dual-stack socket is the open question.
+TCP direct dials are AF_INET (the family follows the concrete destination) and were verified
+bound; UDP never was.
+
+| File | Change |
+|---|---|
+| `transport/internet/system_dialer.go` | The UDP branch listens on `udp4` or `udp6` chosen by the resolved destination's family, with the matching wildcard, so the socket's family is never in question. An explicit source (`sendThrough`) keeps the old `"udp"`. The socket's local port is noted in the registry below; `PacketConnWrapper.Close` forgets it — only for the conn this dialer created (`owned`), so the udpmask rewrap in `transport/internet/udp` does not confuse it. |
+| `transport/internet/udp_ports.go` | **New.** The registry: `IsOwnUDPPort(port)` answers whether one of the direct outbound's UDP sockets currently holds that port. |
+| `proxy/tun/udp_fullcone.go` | `HandlePacket` refuses two kinds of *new* flow, both counted and logged at Warning on the first and every 1000th drop. A source port that `IsOwnUDPPort` claims is a packet of ours that came back through the tun — it is dropped instead of becoming a flow, which ends a loop at its first hop and names it in the log. And past `maxUDPFlows` (4096) new flows are dropped; existing flows are untouched. 4096 because the reaper keeps a one-shot flow for `ConnectionIdle` (300 s), so the cap is 13.6 new source ports per second sustained for five minutes — far above any resolver or game — while a close wave of that size stays under the thread cap that killed the service at ~5.7k. |
+| `proxy/tun/udp_fullcone_test.go` | Pins both refusals. |
+| `transport/internet/system_dialer_test.go` | **New.** Pins the socket family against a loopback listener of each family, and that the port is registered exactly while the socket is open. |
+| `common/log/logger.go` | The console writer now writes through the standard library logger (`log.Writer()`, `log.Prefix()`, `log.Flags()`) instead of a private logger on `os.Stdout`. A Windows service has no stdout, and the zapsplit service redirects the standard logger into its own log file — which is the only place the two warnings above can be read. Everywhere else the standard logger defaults to stderr with date and time, so the visible change is stdout → stderr. |
+| `transport/internet/system_listener_test.go` | `control.Raw` left with sing (see above); replaced by the `conn.Control` it wrapped, so the package's tests compile again. |
+
+Caveat: the loop is inferred, not captured. The first `dropped a udp packet that came back into
+the tun from our own socket` line in a service log is the confirmation; the family change is
+meant to make sure that line never appears. If it does appear after this patch, the binding is
+not the cause and the capture is the next step.
+
 ## Verifying the result
 
 ```sh
