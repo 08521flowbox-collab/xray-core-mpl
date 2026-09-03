@@ -29,6 +29,11 @@ const (
 	// cap; unset keeps the stack defaults. See proxy/tun/stack_gvisor.go.
 	TunTCPBufDefaultKey = "xray.tun.tcp.bufdefault"
 	TunTCPBufMaxKey     = "xray.tun.tcp.bufmax"
+	// TunMaxHandshakesKey and TunMaxUDPFlowsKey override the tun stack's
+	// in-flight TCP handshake bound and UDP flow-table size; unset keeps the
+	// fork defaults. See proxy/tun/stack_gvisor.go and udp_fullcone.go.
+	TunMaxHandshakesKey = "xray.tun.maxhandshakes"
+	TunMaxUDPFlowsKey   = "xray.tun.maxudpflows"
 
 	MphCachePath = "xray.mph.cache"
 )

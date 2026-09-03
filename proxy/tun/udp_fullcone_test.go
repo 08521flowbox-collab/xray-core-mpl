@@ -265,21 +265,21 @@ func TestHandlePacketEvictsTheOldestFlowWhenTheTableIsFull(t *testing.T) {
 	defer handler.Close()
 
 	dst := net.UDPDestination(net.LocalHostIP, 123)
-	for i := 0; i < maxUDPFlows+10; i++ {
+	for i := 0; i < handler.maxFlows+10; i++ {
 		handler.HandlePacket(net.UDPDestination(net.LocalHostIP, net.Port(1000+i)), dst, []byte{1})
 	}
 
 	handler.RLock()
 	flows := len(handler.udpConns)
 	handler.RUnlock()
-	if flows != maxUDPFlows {
-		t.Fatalf("flows = %d, expected %d", flows, maxUDPFlows)
+	if flows != handler.maxFlows {
+		t.Fatalf("flows = %d, expected %d", flows, handler.maxFlows)
 	}
 	if n := handler.evictions.Load(); n != 10 {
 		t.Fatalf("evictions = %d, expected 10", n)
 	}
 	handler.RLock()
-	_, newest := handler.udpConns[net.UDPDestination(net.LocalHostIP, net.Port(1000+maxUDPFlows+9))]
+	_, newest := handler.udpConns[net.UDPDestination(net.LocalHostIP, net.Port(1000+handler.maxFlows+9))]
 	handler.RUnlock()
 	if !newest {
 		t.Fatal("the newest flow was the one refused")
@@ -326,5 +326,18 @@ func TestDNSFlowIsReapedEarly(t *testing.T) {
 			t.Fatal("DNS flow was not reaped on portIdle[53]")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestMaxUDPFlowsFollowsTheEnvFlag(t *testing.T) {
+	t.Setenv("xray.tun.maxudpflows", "8192")
+	handler := newUdpConnectionHandler(
+		func(conn net.Conn, dest net.Destination) {},
+		func(data []byte, src net.Destination, dst net.Destination) error { return nil },
+		0,
+	)
+	defer handler.Close()
+	if handler.maxFlows != 8192 {
+		t.Fatalf("maxFlows = %d, expected 8192", handler.maxFlows)
 	}
 }

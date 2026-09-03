@@ -10,10 +10,13 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/transport/internet"
 )
 
-const maxUDPFlows = 4096
+// defaultMaxUDPFlows caps the flow table; a host with more memory raises it
+// through platform.TunMaxUDPFlowsKey.
+const defaultMaxUDPFlows = 4096
 
 // portIdle is the idle timeout for flows whose destination port names a
 // request/response protocol, the same table sing-box keeps as
@@ -52,6 +55,7 @@ type udpConnectionHandler struct {
 	// blocked reading conn.egress, until whatever downstream handler happens
 	// to run its own idle timeout and call Close(). See MODIFICATIONS.md.
 	idleTimeout   time.Duration
+	maxFlows      int
 	stopReap      chan struct{}
 	closeReapOnce sync.Once
 
@@ -67,11 +71,16 @@ type udpConnectionHandler struct {
 }
 
 func newUdpConnectionHandler(handleConnection func(conn net.Conn, dest net.Destination), writePacket func(data []byte, src net.Destination, dst net.Destination) error, idleTimeout time.Duration) *udpConnectionHandler {
+	maxFlows := platform.NewEnvFlag(platform.TunMaxUDPFlowsKey).GetValueAsInt(defaultMaxUDPFlows)
+	if maxFlows != defaultMaxUDPFlows {
+		errors.LogInfo(context.Background(), "tun: max udp flows ", maxFlows)
+	}
 	handler := &udpConnectionHandler{
 		udpConns:         make(map[net.Destination]*udpConn),
 		handleConnection: handleConnection,
 		writePacket:      writePacket,
 		idleTimeout:      idleTimeout,
+		maxFlows:         maxFlows,
 		stopReap:         make(chan struct{}),
 		ownPort:          internet.IsOwnUDPPort,
 	}
@@ -116,7 +125,7 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 
 	conn, found = u.udpConns[src]
 	if !found {
-		if len(u.udpConns) >= maxUDPFlows {
+		if len(u.udpConns) >= u.maxFlows {
 			u.evictOldestLocked(src, dst)
 		}
 		egress := make(chan *packet, egressQueue)

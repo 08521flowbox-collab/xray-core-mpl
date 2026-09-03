@@ -740,6 +740,24 @@ dialling" is the question the first two builds could not answer:
 | `transport/internet/system_dialer.go` | `Timeout: systemDialTimeout`; the TCP branch acquires a slot for `dest.NetAddr()` and dials under the returned context. |
 | `transport/internet/dial_gate_test.go` | **New.** With the ring full the newcomer starts within 100 ms, the oldest dial's context reports `context.Canceled` and the younger one is untouched; twenty evictions in a row on a ring of one never lose a slot; a dial blocked on a filled `listen` backlog returns within microseconds of `ResetSystemDials` (skipped if the platform will not let the accept queue fill). |
 
+## Letting the host raise the tun stack's bounds
+
+Not a licence change. The 256 in-flight handshake bound in `proxy/tun/stack_gvisor.go` and the
+4096-flow UDP table in `proxy/tun/udp_fullcone.go` were sized for the iOS 50 MB cap and then
+applied to every host. Both stay as the defaults; a host with more room overrides them.
+
+| Env flag | Default | Read where |
+|---|---|---|
+| `xray.tun.maxhandshakes` | 256 | `stackGVisor.Start`, when the TCP forwarder is built |
+| `xray.tun.maxudpflows` | 4096 | `newUdpConnectionHandler`, once, into `udpConnectionHandler.maxFlows` |
+
+Same mechanism as the TCP buffer flags above (`platform.NewEnvFlag(...).GetValueAsInt(default)`);
+`zapsplit-libzapcore` sets them from `tun.maxHandshakes` / `tun.maxUdpFlows` in its settings before
+`AttachTun`. Android sends 1024 / 8192; iOS and Windows send nothing. An override that differs from
+the default is logged once at Info. `TestHandlePacketEvictsTheOldestFlowWhenTheTableIsFull` reads
+the bound off the handler instead of the former constant; `TestMaxUDPFlowsFollowsTheEnvFlag` pins
+the override.
+
 ## Verifying the result
 
 ```sh
