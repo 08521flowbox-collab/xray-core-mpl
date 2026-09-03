@@ -740,6 +740,24 @@ dialling" is the question the first two builds could not answer:
 | `transport/internet/system_dialer.go` | `Timeout: systemDialTimeout`; the TCP branch acquires a slot for `dest.NetAddr()` and dials under the returned context. |
 | `transport/internet/dial_gate_test.go` | **New.** With the ring full the newcomer starts within 100 ms, the oldest dial's context reports `context.Canceled` and the younger one is untouched; twenty evictions in a row on a ring of one never lose a slot; a dial blocked on a filled `listen` backlog returns within microseconds of `ResetSystemDials` (skipped if the platform will not let the accept queue fill). |
 
+## Completing the forwarder request after the handshake, not after the connection
+
+Not a licence change. Upstream's tun handler calls `r.Complete(false)` after `HandleConnection`
+returns, i.e. when the connection is over. gVisor's `tcp.Forwarder` removes the connection id
+from its in-flight table only in `Complete`, so the `maxInFlight` argument to `NewForwarder`
+was bounding *live connections*, not handshakes: with the 256 this fork chose for iOS, the
+257th concurrent TCP connection's SYN was silently dropped until some earlier connection
+closed. Measured on Android 2026-09-03 with the bound at 1024: a burst of 2000 connects to a
+blackholed address connected 1018 and timed out the other 982.
+
+| File | Change |
+|---|---|
+| `proxy/tun/stack_gvisor.go` | `r.Complete(false)` moves to right after a successful `CreateEndpoint`, where sing-tun calls it; the copy after `HandleConnection` is gone. The error path still `Complete(true)`s. |
+
+`maxInFlight` now bounds only SYNs whose handshake has not finished, which on a phone talking
+to its own stack is microseconds each. The concurrency of *outbound* dials stays bounded by
+`SetMaxConcurrentSystemDials` where a host sets it.
+
 ## Letting the host raise the tun stack's bounds
 
 Not a licence change. The 256 in-flight handshake bound in `proxy/tun/stack_gvisor.go` and the

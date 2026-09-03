@@ -96,6 +96,13 @@ func (t *stackGVisor) Start() error {
 				r.Complete(true)
 				return
 			}
+			// Complete here, not after HandleConnection: the forwarder only
+			// drops the id from its in-flight table in Complete, so completing
+			// at the end made maxInFlight a cap on live connections rather than
+			// on handshakes. Measured 2026-09-03: a 2000-connection burst
+			// through a 1024 bound connected 1018 and timed out the rest. This
+			// is where sing-tun completes too.
+			r.Complete(false)
 
 			options := ep.SocketOptions()
 			options.SetKeepAlive(false)
@@ -108,10 +115,7 @@ func (t *stackGVisor) Start() error {
 				net.TCPDestination(net.IPAddress(id.LocalAddress.AsSlice()), net.Port(id.LocalPort)),
 			)
 
-			// close the socket
 			ep.Close()
-			// send connection complete upstream
-			r.Complete(false)
 		}(r)
 	})
 	ipStack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
