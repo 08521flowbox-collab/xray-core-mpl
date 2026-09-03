@@ -49,7 +49,7 @@ type GVisorTun interface {
 }
 
 // NewStack builds new ip stack (using gVisor)
-const maxInFlightHandshakes = 1024
+const maxInFlightHandshakes = 256
 
 func NewStack(ctx context.Context, options StackOptions, handler *Handler) (Stack, error) {
 	gStack := &stackGVisor{
@@ -76,8 +76,9 @@ func (t *stackGVisor) Start() error {
 
 	// maxInFlight bounds the handshakes the stack holds open at once; each one
 	// is a gVisor endpoint until the peer's ACK or a timeout. sing-tun uses 1024
-	// for the same forwarder, and on a memory-capped process that bound is the
-	// only thing standing between a connection burst and the jetsam line.
+	// for the same forwarder; this fork uses a quarter of that, because on a
+	// memory-capped process that bound is the only thing standing between a
+	// connection burst and the jetsam line.
 	tcpForwarder := tcp.NewForwarder(ipStack, 0, maxInFlightHandshakes, func(r *tcp.ForwarderRequest) {
 		go func(r *tcp.ForwarderRequest) {
 			var wq waiter.Queue

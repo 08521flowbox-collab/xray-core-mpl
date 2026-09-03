@@ -112,7 +112,7 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		}
 	}
 	dialer := &net.Dialer{
-		Timeout:         time.Second * 16,
+		Timeout:         systemDialTimeout,
 		LocalAddr:       resolveSrcAddr(dest.Network, src),
 		KeepAlive:       keepAlive,
 		KeepAliveConfig: keepAliveConfig,
@@ -143,6 +143,15 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 				}
 			})
 		}
+	}
+
+	if dest.Network == net.Network_TCP {
+		dialCtx, release, err := acquireSystemDial(ctx, dest.NetAddr())
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		ctx = dialCtx
 	}
 
 	return dialer.DialContext(ctx, dest.Network.SystemString(), dest.NetAddr())

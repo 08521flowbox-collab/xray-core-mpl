@@ -609,8 +609,12 @@ The write side is unchanged. `sendmsg_x` is behind an experimental flag in sing-
 Not a licence change. `tcp.NewForwarder`'s third argument is how many half-open handshakes
 the stack keeps at once; each is a gVisor endpoint until the peer's ACK or a timeout. The
 fork passed 65535, sing-tun passes 1024, and on a memory-capped process that bound is the
-only thing between a connection burst and the jetsam line. `maxInFlightHandshakes = 1024` in
-`proxy/tun/stack_gvisor.go`.
+only thing between a connection burst and the jetsam line. `maxInFlightHandshakes` in
+`proxy/tun/stack_gvisor.go`, 1024 at first and **256 since 2026-09-03**. The 1100-connection
+burst that killed the iOS extension that day never came near even the old bound — a tun
+handshake completes immediately, it is the outbound dial behind it that parks — so lowering
+the number costs nothing and removes one multiplier if a burst ever does back up here.
+Global: all three hosts get 256.
 
 ## Capping the DNS cache
 
@@ -661,6 +665,80 @@ construction.
 
 Nothing changes for a config that still lists domains and prefixes in the rule: the
 registry is empty unless the embedding application fills it.
+
+## Bounding, shortening and cancelling the outbound system dials
+
+Not a licence change. Every outbound TCP connection ends at `DefaultSystemDialer.Dial`, and
+until now that call had one bound of any kind: a 16 s dial timeout. On 2026-09-03 an iOS
+packet tunnel died to what that allows. An app in the background opened ~1100 TCP connections
+to blocked addresses in five seconds; routing sent them to `freedom`, and 958 goroutines sat in
+`net.(*netFD).connect → waitWrite` with no SYN-ACK coming. Goroutine stacks alone went from
+2 MB to 19.8 MB and the extension from 20 MB to 47.6 MB — jetsam kills it at 50. Nothing in the
+process was leaking; it was doing exactly what it was told, 1100 times at once.
+
+Three changes, all in `transport/internet/dial_gate.go` (new) plus its two lines in
+`system_dialer.go`:
+
+| Change | Scope |
+|---|---|
+| `SetMaxConcurrentSystemDials(n)`: a bounded set of dial slots around the TCP dial. **A new dial never waits** — if every slot is taken it cancels the oldest dial in flight and takes over its slot. Zero (the default) is unlimited. | **Per host.** iOS sends `tun.maxDials = 256`; Android and Windows send nothing and stay unlimited. |
+| `systemDialTimeout` 16 s → 5 s. | Global. |
+| `ResetSystemDials()`: cancels every dial in the table, so dials still in `connect()` return at once. | Global. |
+
+Why the gate sits in `DefaultSystemDialer.Dial` and not in `DialSystem`: `DialSystem` resolves
+the destination first, and that resolution can itself need a dial. Holding a slot across it
+would let the resolvers wait on dials that can never get a slot. The lower call has no such
+dependency — it only connects. It also means `TcpRaceDial` (happy eyeballs), which calls the
+same method, is covered, and the `dialerProxy` path, which is a pipe rather than a socket, is
+not. UDP is untouched: it returns before the gate.
+
+**Why the newcomer always wins, and nothing waits.** Two builds were measured on the phone
+before this shape was settled on:
+
+| Build | Result |
+|---|---|
+| Queue at the limit (64 slots) | Held the memory line — storm peak 30.4 MB against the 47.6 MB that got the extension killed — but for a minute the log read `outbound dial waited ~14s for one of 64 dial slots`. The 64 slots were all held by dials that would never answer, each for the full 5 s timeout, and every healthy connection from every other app queued behind them. |
+| Evict, but only dials stalled for at least 1 s | `evicted 320 stalled dials in the last window` every 5 s for minutes — the storm is continuous, not a pulse — and `outbound dial waited 4–6s` still appeared, because a newcomer could evict on arrival while an already-waiting dial only re-checked on a timer. |
+
+So the age guardrail is gone: **the slots are a fixed-size ring, the oldest dial loses.** Hao's
+trade-off, and it is the trade-off, not an oversight: the dials that pile up are the stalled
+ones, so the oldest is almost always one of them; and when it is not — when a healthy 300 ms
+connect gets cancelled — the cost is one RST and one retry by the app, which is one SYN. That is
+cheaper than any amount of waiting, and it makes the worst case a constant: at most `maxDials`
+sockets in `connect()` at once, whatever the arrival rate. 256 of them is about 5 MB of
+goroutine stack, inside what the 50 MB cap leaves once the buffers are at 32/64 KiB.
+
+Slot accounting is a token per dial: the evictor marks the victim `stolen` so the victim's own
+release does not hand the token back, and the evictor inherits it. Reaching a full ring with an
+empty table is impossible; if it ever happens the dial fails with an `[Error]` rather than
+blocking.
+
+5 s applies to every outbound, proxy dials to the exit node included, because the timeout only
+covers the TCP connect — the REALITY/Vision handshake runs after `Dial` returns and is not on
+this clock. Measured connects to the Singapore exit are 50–300 ms.
+
+The reset is what makes the host's out-of-memory response mean anything. iOS reacts to memory
+pressure by rebuilding the stack (`DetachTun → AttachTun`), which drops every gVisor flow — but
+a dropped flow does not close the system socket its handler is blocked in, so before this the
+two resets during the incident left *more* goroutines behind than they started with (1036 →
+1170). `zapsplit-libzapcore`'s `dataplane.DetachTun` now calls `ResetSystemDials` before it
+removes the tun inbound, so "dropping every flow" reaches `connect()` too. The in-flight table
+is the one source of truth: the reset walks it, and so does the eviction.
+
+Nothing is logged per dial, and every line carries a destination, because "who is the app
+dialling" is the question the first two builds could not answer:
+
+| Line | Level | When |
+|---|---|---|
+| `evicted N stalled dials in the last window, oldest waited Xs, last to <addr>` | Warning | at most one per 5 s |
+| `dial slot census: N in flight, M of them over 1s, most common destination <ip> with K` | Info | at most one per 5 s, and only on a dial that found the ring full |
+| `system dials reset, cancelling N in flight` | Warning | once per reset |
+
+| File | Change |
+|---|---|
+| `transport/internet/dial_gate.go` | **New.** The slot channel (`atomic.Pointer`, nil = unlimited), the mutex-guarded in-flight table (cancel func, start time, destination, slot owner), `SetMaxConcurrentSystemDials`, `ResetSystemDials`, `acquireSystemDial`, `evictOldestSystemDial`, and the two throttled log lines. |
+| `transport/internet/system_dialer.go` | `Timeout: systemDialTimeout`; the TCP branch acquires a slot for `dest.NetAddr()` and dials under the returned context. |
+| `transport/internet/dial_gate_test.go` | **New.** With the ring full the newcomer starts within 100 ms, the oldest dial's context reports `context.Canceled` and the younger one is untouched; twenty evictions in a row on a ring of one never lose a slot; a dial blocked on a filled `listen` backlog returns within microseconds of `ResetSystemDials` (skipped if the platform will not let the accept queue fill). |
 
 ## Verifying the result
 
