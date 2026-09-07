@@ -239,6 +239,14 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 		if origTargetAddr == nil {
 			origTargetAddr = ob.Target.Address
 		}
+		if ips := dialAddressesFor(ob.Tag); raceable(sockopt, dest.Network, ips) {
+			conn, err := TcpRaceDial(ctx, src, ips, dest.Port, sockopt, ob.Tag)
+			if err != nil {
+				return nil, err
+			}
+			errors.LogInfo(ctx, "raced dial for ", ob.Tag, " won by ", conn.RemoteAddr())
+			return conn, nil
+		}
 	}
 	if sockopt == nil {
 		return effectiveSystemDialer.Dial(ctx, src, dest, sockopt)

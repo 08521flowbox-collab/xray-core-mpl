@@ -782,6 +782,26 @@ the default is logged once at Info. `TestHandlePacketEvictsTheOldestFlowWhenTheT
 the bound off the handler instead of the former constant; `TestMaxUDPFlowsFollowsTheEnvFlag` pins
 the override.
 
+## Racing an outbound's registered addresses (Happy Eyeballs without DNS)
+
+Not a licence change. Upstream's Happy Eyeballs (`TcpRaceDial`) only starts from the DNS branch
+of `DialSystem`: the destination has to be a domain, `sockopt.domainStrategy` has to resolve it,
+and the lookup has to return two or more IPs. A server that is *configured* as two literals —
+one per family — has no way in, and the DNS app clamps every lookup by its global
+`queryStrategy` besides, so with `USE_IP4` the AAAA never arrives.
+
+| File | Change |
+|---|---|
+| `transport/internet/dial_addresses.go` | **New.** A process-wide table from outbound tag to the IPs its server answers at (`SetDialAddresses` / `ClearDialAddresses`), plus `raceable`, the gate below. |
+| `transport/internet/dialer.go` | `DialSystem` looks the context's outbound tag up in that table before anything else. Two or more IPs, TCP, no `dialerProxy`, and a `sockopt.happyEyeballs` with `maxConcurrentTry > 0` → `TcpRaceDial` over the registered IPs and an Info line naming the winner. Otherwise the original path, untouched. |
+| `transport/internet/dial_addresses_test.go` | **New.** A black-holed v4 and a listening `::1` registered under one tag: the dial lands on `::1` at once. Without `happyEyeballs`, without a registration, or after `ClearDialAddresses`, the configured destination is dialled as before. |
+
+`tryDelayMs` may be zero on this path — every registered address is dialled at once and the
+first connect wins — where upstream's DNS branch reads zero as "not configured". The owner of
+the outbound registers before adding the handler and clears after removing it; the table is
+keyed by tag rather than by server so two handlers for one server in flight during an update
+cannot clear each other's entry.
+
 ## Verifying the result
 
 ```sh
