@@ -2,6 +2,7 @@ package internet
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common/net"
 )
@@ -28,6 +29,17 @@ func ClearDialAddresses(tag string) {
 	dialAddresses.Delete(tag)
 }
 
+// ResetDialAddresses empties the table. Handlers clear their own tag when they
+// are removed, but the last set of a core that is shut down whole stays behind;
+// a long-lived process building core after core would otherwise keep one entry
+// per tag it has ever used.
+func ResetDialAddresses() {
+	dialAddresses.Range(func(key, _ any) bool {
+		dialAddresses.Delete(key)
+		return true
+	})
+}
+
 func DialAddresses(tag string) []net.IP {
 	if tag == "" {
 		return nil
@@ -45,4 +57,30 @@ func raceable(sockopt *SocketConfig, network net.Network, ips []net.IP) bool {
 	return sockopt != nil && sockopt.HappyEyeballs != nil &&
 		sockopt.HappyEyeballs.MaxConcurrentTry > 0 &&
 		len(sockopt.DialerProxy) == 0 && network == net.Network_TCP && len(ips) >= 2
+}
+
+// raceWins counts, per address family, the dials the table above has decided.
+// Nothing in this process reads it; the embedding application does, to learn
+// whether the second address ever carries anything.
+var raceWins struct{ v4, v6 atomic.Uint64 }
+
+func recordRaceWin(addr net.Addr) {
+	tcp, ok := addr.(*net.TCPAddr)
+	if !ok {
+		return
+	}
+	if tcp.IP.To4() != nil {
+		raceWins.v4.Add(1)
+		return
+	}
+	raceWins.v6.Add(1)
+}
+
+func RaceWins() (v4, v6 uint64) {
+	return raceWins.v4.Load(), raceWins.v6.Load()
+}
+
+func ResetRaceWins() {
+	raceWins.v4.Store(0)
+	raceWins.v6.Store(0)
 }

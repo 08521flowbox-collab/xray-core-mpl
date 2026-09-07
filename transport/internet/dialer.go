@@ -244,6 +244,7 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 			if err != nil {
 				return nil, err
 			}
+			recordRaceWin(conn.RemoteAddr())
 			errors.LogInfo(ctx, "raced dial for ", ob.Tag, " won by ", conn.RemoteAddr())
 			return conn, nil
 		}

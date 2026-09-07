@@ -62,6 +62,52 @@ func TestRegisteredAddressesAreRacedAndTheReachableOneWins(t *testing.T) {
 	}
 }
 
+func TestRaceWinsCountTheWinningFamilyOnly(t *testing.T) {
+	listener, port := listenLoopback6(t)
+	defer listener.Close()
+	server := &tcp.Server{}
+	dest, err := server.Start()
+	common.Must(err)
+	defer server.Close()
+
+	ResetRaceWins()
+	const tag = "proxy:count"
+	SetDialAddresses(tag, []net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("::1")})
+	defer ClearDialAddresses(tag)
+
+	ctx, cancel := context.WithTimeout(taggedContext(tag), 5*time.Second)
+	defer cancel()
+	raced, err := DialSystem(ctx, net.TCPDestination(net.ParseAddress("192.0.2.1"), port), raceSockopt())
+	common.Must(err)
+	defer raced.Close()
+	if v4, v6 := RaceWins(); v4 != 0 || v6 != 1 {
+		t.Fatalf("after one race won by ::1, wins = v4 %d v6 %d", v4, v6)
+	}
+
+	plain, err := DialSystem(taggedContext("proxy:none"), net.TCPDestination(net.LocalHostIP, dest.Port), raceSockopt())
+	common.Must(err)
+	defer plain.Close()
+	if v4, v6 := RaceWins(); v4 != 0 || v6 != 1 {
+		t.Fatalf("a dial that was not raced was counted: v4 %d v6 %d", v4, v6)
+	}
+
+	ResetRaceWins()
+	if v4, v6 := RaceWins(); v4 != 0 || v6 != 0 {
+		t.Fatalf("reset left v4 %d v6 %d", v4, v6)
+	}
+}
+
+func TestResetDialAddressesForgetsEveryTag(t *testing.T) {
+	SetDialAddresses("proxy:a", []net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("::1")})
+	SetDialAddresses("proxy:b#1", []net.IP{net.ParseIP("192.0.2.2"), net.ParseIP("::1")})
+	ResetDialAddresses()
+	for _, tag := range []string{"proxy:a", "proxy:b#1"} {
+		if got := DialAddresses(tag); got != nil {
+			t.Fatalf("%s still registered after reset: %v", tag, got)
+		}
+	}
+}
+
 func TestRegisteredAddressesAreIgnoredWithoutHappyEyeballs(t *testing.T) {
 	server := &tcp.Server{}
 	dest, err := server.Start()

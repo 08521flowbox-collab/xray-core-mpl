@@ -792,9 +792,13 @@ one per family — has no way in, and the DNS app clamps every lookup by its glo
 
 | File | Change |
 |---|---|
-| `transport/internet/dial_addresses.go` | **New.** A process-wide table from outbound tag to the IPs its server answers at (`SetDialAddresses` / `ClearDialAddresses` / `DialAddresses`), plus `raceable`, the gate below. |
+| `transport/internet/dial_addresses.go` | **New.** A process-wide table from outbound tag to the IPs its server answers at (`SetDialAddresses` / `ClearDialAddresses` / `DialAddresses`, and `ResetDialAddresses` for the owner to wipe it when it builds a fresh core, so a long-lived process does not keep one entry per tag it has ever used), plus `raceable`, the gate below. |
 | `transport/internet/dialer.go` | `DialSystem` looks the context's outbound tag up in that table before anything else. Two or more IPs, TCP, no `dialerProxy`, and a `sockopt.happyEyeballs` with `maxConcurrentTry > 0` → `TcpRaceDial` over the registered IPs and an Info line naming the winner. Otherwise the original path, untouched. |
-| `transport/internet/dial_addresses_test.go` | **New.** A black-holed v4 and a listening `::1` registered under one tag: the dial lands on `::1` at once. Without `happyEyeballs`, without a registration, or after `ClearDialAddresses`, the configured destination is dialled as before. |
+| `transport/internet/dial_addresses_test.go` | **New.** A black-holed v4 and a listening `::1` registered under one tag: the dial lands on `::1` at once. Without `happyEyeballs`, without a registration, or after `ClearDialAddresses`, the configured destination is dialled as before. A raced win is counted under its family; a dial that was not raced is not. |
+
+The same file keeps two counters, `RaceWins() (v4, v6)` and `ResetRaceWins()`, incremented by
+`DialSystem` at the point it logs the winner. Nothing in the core reads them; the embedding
+application does, to tell whether the second address ever carries anything in the field.
 
 `tryDelayMs` may be zero on this path — every registered address is dialled at once and the
 first connect wins — where upstream's DNS branch reads zero as "not configured". The owner of
