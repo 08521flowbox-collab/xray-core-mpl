@@ -28,7 +28,7 @@ func ClearDialAddresses(tag string) {
 	dialAddresses.Delete(tag)
 }
 
-func dialAddressesFor(tag string) []net.IP {
+func DialAddresses(tag string) []net.IP {
 	if tag == "" {
 		return nil
 	}

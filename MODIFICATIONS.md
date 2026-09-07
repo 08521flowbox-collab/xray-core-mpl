@@ -792,7 +792,7 @@ one per family — has no way in, and the DNS app clamps every lookup by its glo
 
 | File | Change |
 |---|---|
-| `transport/internet/dial_addresses.go` | **New.** A process-wide table from outbound tag to the IPs its server answers at (`SetDialAddresses` / `ClearDialAddresses`), plus `raceable`, the gate below. |
+| `transport/internet/dial_addresses.go` | **New.** A process-wide table from outbound tag to the IPs its server answers at (`SetDialAddresses` / `ClearDialAddresses` / `DialAddresses`), plus `raceable`, the gate below. |
 | `transport/internet/dialer.go` | `DialSystem` looks the context's outbound tag up in that table before anything else. Two or more IPs, TCP, no `dialerProxy`, and a `sockopt.happyEyeballs` with `maxConcurrentTry > 0` → `TcpRaceDial` over the registered IPs and an Info line naming the winner. Otherwise the original path, untouched. |
 | `transport/internet/dial_addresses_test.go` | **New.** A black-holed v4 and a listening `::1` registered under one tag: the dial lands on `::1` at once. Without `happyEyeballs`, without a registration, or after `ClearDialAddresses`, the configured destination is dialled as before. |
 
