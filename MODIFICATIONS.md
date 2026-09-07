@@ -661,10 +661,16 @@ construction.
 | `app/router/condition.go` | `DomainMatcher` gains a `Set`; `NewMphMatcherGroup` routes `Domain_Domain` / `Domain_Full` into it and only substring and regex rules into the MPH group. Same answers, same entry point. |
 | `app/router/prebuilt.go` | **New.** `SetPrebuiltCondition` / `ResetPrebuiltConditions`: a condition registered by rule tag is added in `BuildCondition` as if the rule had declared it. `NewDomainCondition` and `NewPrefixIPMatcher` build the two matchers from plain slices so the lists never become protobuf and one matcher serves both a rule and its QUIC twin. |
 | `app/router/config.go` | `BuildCondition` consults the registry after the port matchers. |
-| `app/router/prefix_matcher.go` | **New.** `PrefixSetMatcher`: sorted, merged IPv4 ranges at eight bytes each, bisected. IPv6 prefixes are dropped — the consumer blocks IPv6 wholesale. `anyGeoIPMatcher` ORs several. `geoip:us` peaks at 18 MB instead of 83 MB. |
+| `app/router/prefix_matcher.go` | **New.** `PrefixSetMatcher`: sorted, merged ranges bisected per family — eight bytes per IPv4 range, thirty-two per IPv6 range, each family in its own table so a 16-byte address never consults the 4-byte one. `anyGeoIPMatcher` ORs several. `geoip:us` peaks at 18 MB instead of 83 MB. |
 
 Nothing changes for a config that still lists domains and prefixes in the rule: the
 registry is empty unless the embedding application fills it.
+
+Until 2026-09-07 the matcher dropped IPv6 prefixes, because the consumer blocked IPv6
+wholesale. It keeps them now: `geoip:us` is 128k v4 + 172k v6 prefixes, and with both
+tables sized up front instead of grown by append, the consumer's `geo_membench_test.go`
+(`BENCH_BUDGET=40`) measures `geoip:us` at 24 MB peak live heap / 8 MB steady, against
+17 / 3 MB when v6 was dropped. `geoip:cn` + `geosite:cn` is unchanged at 15 / 3 MB.
 
 ## Bounding, shortening and cancelling the outbound system dials
 
