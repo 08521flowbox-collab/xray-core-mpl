@@ -806,6 +806,20 @@ the outbound registers before adding the handler and clears after removing it; t
 keyed by tag rather than by server so two handlers for one server in flight during an update
 cannot clear each other's entry.
 
+## Recovering a panic inside a racing dial goroutine
+
+`tcpTryDial` runs on its own goroutine, so a panic there ends the process instead of one
+dial. The 2026-09-11 Android fatal reports came out of this goroutine (a `SIGSEGV` inside
+`case <-ctx.Done()`, which the runtime then failed to unwind), and while a `recover` cannot
+stop a runtime `throw`, it does turn any ordinary panic on this path into one failed racer:
+the goroutine logs the stack and sends an error on `resultCh` (buffered to `len(ips)`, so the
+send never blocks), and `TcpRaceDial` carries on with the other addresses.
+
+| File | Change |
+|---|---|
+| `transport/internet/happy_eyeballs.go` | `tcpTryDial` defers a `recover` that logs and reports the panic as a dial error. |
+| `transport/internet/happy_eyeballs_test.go` | **New.** A system dialer that panics must produce an error from `TcpRaceDial`, not a crash. |
+
 ## Verifying the result
 
 ```sh

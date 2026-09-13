@@ -2,9 +2,11 @@ package internet
 
 import (
 	"context"
+	"runtime/debug"
+	"time"
+
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	"time"
 )
 
 type result struct {
@@ -156,6 +158,12 @@ func sortIPs(ips []net.IP, prioritizeIPv6 bool, interleave uint32) []net.IP {
 }
 
 func tcpTryDial(ctx context.Context, src net.Address, sockopt *SocketConfig, ip net.IP, port net.Port, index int, resultCh chan<- *result) {
+	defer func() {
+		if r := recover(); r != nil {
+			errors.LogError(ctx, "race dial to ", ip, " panicked: ", r, "\n", string(debug.Stack()))
+			resultCh <- &result{err: errors.New("race dial panicked: ", r), index: index}
+		}
+	}()
 	conn, err := effectiveSystemDialer.Dial(ctx, src, net.Destination{Address: net.IPAddress(ip), Network: net.Network_TCP, Port: port}, sockopt)
 	select {
 	case <-ctx.Done():
