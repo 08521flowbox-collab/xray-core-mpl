@@ -39,7 +39,13 @@ func newHTTPClient(ctxv context.Context, dispatcher routing.Dispatcher, handler 
 			if err != nil {
 				return nil, err
 			}
-			return tagged.Dialer(ctxv, dispatcher, dest, handler)
+			linkCtx, cancel := context.WithTimeout(ctxv, timeout)
+			conn, err := tagged.Dialer(linkCtx, dispatcher, dest, handler)
+			if err != nil {
+				cancel()
+				return nil, err
+			}
+			return &linkConn{Conn: conn, cancel: cancel}, nil
 		},
 	}
 	return &http.Client{
@@ -50,6 +56,16 @@ func newHTTPClient(ctxv context.Context, dispatcher routing.Dispatcher, handler 
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+type linkConn struct {
+	net.Conn
+	cancel context.CancelFunc
+}
+
+func (c *linkConn) Close() error {
+	c.cancel()
+	return c.Conn.Close()
 }
 
 // MeasureDelay returns the delay time of the request to dest
