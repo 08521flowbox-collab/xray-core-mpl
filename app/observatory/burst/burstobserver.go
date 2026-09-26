@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"sync"
+	"time"
 
 	"github.com/xtls/xray-core/app/observatory"
 	"github.com/xtls/xray-core/common"
@@ -41,25 +42,33 @@ func (o *Observer) createResult() []*observatory.OutboundStatus {
 	o.hp.access.Lock()
 	defer o.hp.access.Unlock()
 	for name, value := range o.hp.Results {
+		stats := value.getStatistics()
 		status := observatory.OutboundStatus{
-			Alive:           value.getStatistics().All != value.getStatistics().Fail,
-			Delay:           value.getStatistics().Average.Milliseconds(),
+			Alive:           value.alive(stats),
+			Delay:           stats.Average.Milliseconds(),
 			LastErrorReason: "",
 			OutboundTag:     name,
-			LastSeenTime:    0,
-			LastTryTime:     0,
+			LastSeenTime:    unixOrZero(value.lastSeen),
+			LastTryTime:     unixOrZero(value.lastTry),
 			HealthPing: &observatory.HealthPingMeasurementResult{
-				All:       int64(value.getStatistics().All),
-				Fail:      int64(value.getStatistics().Fail),
-				Deviation: int64(value.getStatistics().Deviation),
-				Average:   int64(value.getStatistics().Average),
-				Max:       int64(value.getStatistics().Max),
-				Min:       int64(value.getStatistics().Min),
+				All:       int64(stats.All),
+				Fail:      int64(stats.Fail),
+				Deviation: int64(stats.Deviation),
+				Average:   int64(stats.Average),
+				Max:       int64(stats.Max),
+				Min:       int64(stats.Min),
 			},
 		}
 		result = append(result, &status)
 	}
 	return result
+}
+
+func unixOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
 }
 
 func (o *Observer) Type() interface{} {

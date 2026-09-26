@@ -24,6 +24,9 @@ type HealthPingRTTS struct {
 
 	lastUpdateAt time.Time
 	stats        *HealthPingStats
+
+	lastTry  time.Time
+	lastSeen time.Time
 }
 
 type pingRTT struct {
@@ -67,6 +70,22 @@ func (h *HealthPingRTTS) Put(d time.Duration) {
 	now := time.Now()
 	h.rtts[h.idx].time = now
 	h.rtts[h.idx].value = d
+	h.lastTry = now
+	if d != rttFailed {
+		h.lastSeen = now
+	}
+}
+
+func (h *HealthPingRTTS) alive(stats *HealthPingStats) bool {
+	return stats.All > stats.Fail && h.failStreak() < deadAfterFailures
+}
+
+func (h *HealthPingRTTS) failStreak() int {
+	streak := 0
+	for streak < len(h.rtts) && h.rtts[h.calcIndex(h.cap-streak)].value == rttFailed {
+		streak++
+	}
+	return streak
 }
 
 func (h *HealthPingRTTS) calcIndex(step int) int {

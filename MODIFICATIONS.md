@@ -820,6 +820,32 @@ send never blocks), and `TcpRaceDial` carries on with the other addresses.
 | `transport/internet/happy_eyeballs.go` | `tcpTryDial` defers a `recover` that logs and reports the panic as a dial error. |
 | `transport/internet/happy_eyeballs_test.go` | **New.** A system dialer that panics must produce an error from `TcpRaceDial`, not a crash. |
 
+## Reading an exit's health out of the burst observatory
+
+Upstream's burst observer calls an outbound alive while any sample in its window succeeded.
+With the five-sample window the client runs, an exit that stops answering keeps its traffic
+for five probe periods: 25 minutes at the client's foreground period, 75 in the background.
+It also reports `LastSeenTime` and `LastTryTime` as zero, so a caller cannot tell a recent
+reading from a stale one.
+
+- An outbound is now dead once its **two newest** samples both failed, or when nothing in the
+  window succeeded (the upstream rule, which still decides an outbound's first sample). One
+  failure between successes changes nothing, so a single lost probe does not move traffic;
+  the caller confirms a first failure with a second probe of its own.
+- `LastTryTime` and `LastSeenTime` carry the last attempt and the last success in Unix
+  seconds, the same meaning `app/observatory/observer.go` gives them.
+- The ping link carries the ping timeout as its deadline and is released when the conn closes.
+  It ran on the observer's context, so a ping that timed out left the VLESS outbound retrying
+  the node (`retry.ExponentialBackoff`) for minutes with nothing able to cancel it.
+
+| File | Change |
+|---|---|
+| `app/observatory/burst/burst.go` | `deadAfterFailures = 2`. |
+| `app/observatory/burst/healthping_result.go` | `HealthPingRTTS` records `lastTry`/`lastSeen` in `Put`; `alive(stats)` and `failStreak()` implement the rule above. |
+| `app/observatory/burst/burstobserver.go` | `createResult` reads the statistics once and fills `Alive`, `LastTryTime` and `LastSeenTime` from them. |
+| `app/observatory/burst/ping.go` | `newHTTPClient` dials the tagged link under `context.WithTimeout(ctx, timeout)` and cancels it in `linkConn.Close`. |
+| `app/observatory/burst/healthping_alive_test.go` | **New.** The streak, its wrap around the ring, a first sample that failed, and the two timestamps. |
+
 ## Verifying the result
 
 ```sh

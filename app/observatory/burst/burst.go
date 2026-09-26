@@ -10,3 +10,5 @@ const (
 	rttUntested
 	rttUnqualified
 )
+
+const deadAfterFailures = 2
