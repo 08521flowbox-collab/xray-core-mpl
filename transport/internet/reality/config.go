@@ -14,10 +14,16 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 )
 
+var DialContext func(ctx context.Context, network, address string) (net.Conn, error)
+
 func (c *Config) GetREALITYConfig() *reality.Config {
 	var dialer net.Dialer
+	dial := dialer.DialContext
+	if DialContext != nil {
+		dial = DialContext
+	}
 	config := &reality.Config{
-		DialContext: dialer.DialContext,
+		DialContext: dial,
 
 		Show: c.Show,
 		Type: c.Type,
