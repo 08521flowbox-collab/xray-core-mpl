@@ -240,11 +240,10 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 			origTargetAddr = ob.Target.Address
 		}
 		if ips := DialAddresses(ob.Tag); raceable(sockopt, dest.Network, ips) {
-			conn, err := TcpRaceDial(ctx, src, ips, dest.Port, sockopt, ob.Tag)
+			conn, err := raceDialAddresses(ctx, src, ips, dest.Port, sockopt, ob.Tag)
 			if err != nil {
 				return nil, err
 			}
-			recordRaceWin(conn.RemoteAddr())
 			errors.LogInfo(ctx, "raced dial for ", ob.Tag, " won by ", conn.RemoteAddr())
 			return conn, nil
 		}

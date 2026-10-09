@@ -1,10 +1,12 @@
 package internet
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 
 	"github.com/xtls/xray-core/common/net"
+	"google.golang.org/protobuf/proto"
 )
 
 // dialAddresses maps an outbound tag to the IPs its server can be reached at.
@@ -51,8 +53,8 @@ func DialAddresses(tag string) []net.IP {
 	return ips.([]net.IP)
 }
 
-// Unlike the DNS-driven entry in DialSystem, TryDelayMs may be zero here: every
-// registered address is dialled at once and the first to connect wins.
+// Unlike the DNS-driven entry in DialSystem, TryDelayMs may be zero here, in
+// which case every registered address is dialled at once.
 func raceable(sockopt *SocketConfig, network net.Network, ips []net.IP) bool {
 	return sockopt != nil && sockopt.HappyEyeballs != nil &&
 		sockopt.HappyEyeballs.MaxConcurrentTry > 0 &&
@@ -64,6 +66,25 @@ func raceable(sockopt *SocketConfig, network net.Network, ips []net.IP) bool {
 // whether the second address ever carries anything.
 var raceWins struct{ v4, v6 atomic.Uint64 }
 
+// preferV6 is the family that won last. Which family works belongs to the
+// network the device is on rather than to any one server, so it is one value
+// for every tag, and the next race dials that family first.
+var preferV6 atomic.Bool
+
+func raceDialAddresses(ctx context.Context, src net.Address, ips []net.IP, port net.Port, sockopt *SocketConfig, tag string) (net.Conn, error) {
+	ordered := sockopt
+	if v6 := preferV6.Load(); sockopt.HappyEyeballs.PrioritizeIpv6 != v6 {
+		ordered = proto.Clone(sockopt).(*SocketConfig)
+		ordered.HappyEyeballs.PrioritizeIpv6 = v6
+	}
+	conn, err := TcpRaceDial(ctx, src, ips, port, ordered, tag)
+	if err != nil {
+		return nil, err
+	}
+	recordRaceWin(conn.RemoteAddr())
+	return conn, nil
+}
+
 func recordRaceWin(addr net.Addr) {
 	tcp, ok := addr.(*net.TCPAddr)
 	if !ok {
@@ -71,9 +92,11 @@ func recordRaceWin(addr net.Addr) {
 	}
 	if tcp.IP.To4() != nil {
 		raceWins.v4.Add(1)
+		preferV6.Store(false)
 		return
 	}
 	raceWins.v6.Add(1)
+	preferV6.Store(true)
 }
 
 func RaceWins() (v4, v6 uint64) {
@@ -83,4 +106,5 @@ func RaceWins() (v4, v6 uint64) {
 func ResetRaceWins() {
 	raceWins.v4.Store(0)
 	raceWins.v6.Store(0)
+	preferV6.Store(false)
 }
