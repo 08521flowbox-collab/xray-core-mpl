@@ -110,7 +110,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	output := link.Writer
 
 	var conn stat.Connection
-	err := retry.ExponentialBackoff(5, 100).On(func() error {
+	err := retry.ExponentialBackoff(1, 100).On(func() error {
 		dialDest := destination
 		if h.config.DomainStrategy.HasStrategy() && dialDest.Address.Family().IsDomain() {
 			strategy := h.config.DomainStrategy
