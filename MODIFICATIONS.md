@@ -23,8 +23,9 @@ published here.
 
 ## Removing `github.com/sagernet/sing-shadowsocks`
 
-Shadowsocks-2022 cannot be implemented without it, so the protocol is dropped. Legacy
-Shadowsocks (AEAD) is untouched and still works.
+Shadowsocks-2022 could not be implemented without it at the base tag, so the protocol was
+dropped. Legacy Shadowsocks (AEAD) is untouched and still works. Upstream has since rewritten
+the protocol without sing; see [Restoring Shadowsocks 2022 without sing](#restoring-shadowsocks-2022-without-sing).
 
 | File | Change |
 |---|---|
@@ -845,6 +846,25 @@ reading from a stale one.
 | `app/observatory/burst/burstobserver.go` | `createResult` reads the statistics once and fills `Alive`, `LastTryTime` and `LastSeenTime` from them. |
 | `app/observatory/burst/ping.go` | `newHTTPClient` dials the tagged link under `context.WithTimeout(ctx, timeout)` and cancels it in `linkConn.Close`. |
 | `app/observatory/burst/healthping_alive_test.go` | **New.** The streak, its wrap around the ring, a first sample that failed, and the two timestamps. |
+
+## Restoring Shadowsocks 2022 without sing
+
+Upstream rewrote `proxy/shadowsocks_2022` on its own primitives in
+[#6831](https://github.com/XTLS/Xray-core/pull/6831) and
+[#6866](https://github.com/XTLS/Xray-core/pull/6866): AEAD from the standard library, BLAKE3 key
+derivation from `lukechampine.com/blake3` (MIT, already a dependency of this tree), and no
+`sagernet` import anywhere in the package. The package is taken from upstream as of those two
+commits, plus one server-side fix that is not upstream yet: a UDP packet that fails
+authentication no longer leaves a session behind in the multi-user inbound.
+
+Only the protobuf path is restored. `infra/conf/shadowsocks.go` still rejects a 2022 method in
+JSON, because the consumer builds its configuration as protobuf and never links `infra/conf`.
+
+| File | Change |
+|---|---|
+| `proxy/shadowsocks_2022/` | **Restored** (whole package) from upstream's sing-free rewrite. |
+| `proxy/shadowsocks_2022/inbound_multi.go` | Drops the UDP session a packet that failed authentication created. |
+| `proxy/shadowsocks_2022/inbound_multi_udp_session_test.go` | **New.** Pins the fix above. |
 
 ## Verifying the result
 

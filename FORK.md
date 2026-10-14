@@ -21,7 +21,8 @@ code, and the GPL's terms reach the whole combined work.
 `github.com/sagernet/sing-shadowsocks`, needed by `proxy/shadowsocks_2022`, is
 under the same licence.
 
-Removing both is the entire purpose of this fork. There are no feature additions.
+Removing both is the entire purpose of this fork. Shadowsocks 2022 is back since upstream
+rewrote it without `sing-shadowsocks`; see `MODIFICATIONS.md`.
 
 ## What changed
 
