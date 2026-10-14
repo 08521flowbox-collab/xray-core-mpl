@@ -309,6 +309,7 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 			currentUser = sessionItem.User
 			userPSK = sessionItem.UserPSK
 			sessionItem.Unlock()
+			unauthenticated := currentUser == nil
 
 			if currentUser == nil {
 				// Decrypt EIH
@@ -316,6 +317,7 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 
 				user, ok := i.usersByHash.Load(decryptedHash)
 				if !ok {
+					i.udpSessions.Delete(sessionID)
 					b.Release()
 					continue
 				}
@@ -326,6 +328,9 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 			decoded, err := sessionItem.DecryptAESPayload(i.method, userPSK, sessionID, packetID, rawHeader[:], packetBytes[32:])
 			b.Release()
 			if err != nil {
+				if unauthenticated {
+					i.udpSessions.Delete(sessionID)
+				}
 				continue
 			}
 
