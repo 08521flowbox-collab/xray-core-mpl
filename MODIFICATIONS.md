@@ -647,6 +647,45 @@ Unset means the constants above, so no existing caller changes. The consumer set
 its own tunnel settings just before adding the tun inbound (`zapsplit-libzapcore`'s
 `TUNSettings.TCPBufferKB` / `TCPBufferMaxKB`).
 
+## Sizing forwarded connections by the flags, and resetting the ones nobody reads
+
+Not a licence change. Two ways a forwarded TCP connection held more than the host asked for,
+measured on Android 2026-10-14 (vivo 1906 / Android 11, flags at 128 KiB / 512 KiB, 20
+connections through the tun to a LAN host, Go heap after a forced GC):
+
+- `tcp.NewForwarder` was passed a receive window of 0, which gVisor replaces with its own
+  `DefaultReceiveBufferSize` (1 MiB). Every forwarded endpoint started there whatever
+  `xray.tun.tcp.bufdefault` said, and moderate-receive-buffer only grows a buffer, so a Max
+  below 1 MiB never applied either. The forwarder now gets the stack's receive Default.
+  Twenty uploads into a peer that stopped reading held 15.3 MB before and 8.1 MB after. A
+  host that sets no flag gets the same 1 MiB as before. iOS (32 / 64 KiB) goes from 1 MiB to
+  32-64 KiB on the receive side, which bounds one upload at roughly 32-64 KiB per tun
+  round trip.
+- When the handler returns, the endpoint is closed with whatever the client has not yet
+  acknowledged. If the client's window is zero (an app that holds its socket but stopped
+  reading), gVisor probes that window for as long as the client answers: it has no
+  counterpart of Linux's limit on orphaned connections. Twenty such connections held 14 MB
+  until the client processes exited. Once the handler is done, the forwarder now sets
+  `TCPUserTimeoutOption(closedUnsentTimeout)`, one minute. gVisor checks it only when the
+  probe timer fires, against the time since probing began, and that timer backs off to
+  `MaxRTO` (two minutes), so the endpoint is reset within two minutes of being given up:
+  still held at 80 s, released at 140 s.
+
+The timeout only reaches endpoints the handler has already given up. A live connection whose
+reader pauses is probed as before.
+
+Throughput on the same phone did not move: alternating runs gave 4.2-4.5 MB/s down and
+2.9-3.6 MB/s up for both builds and 4.1-4.5 / 3.3-3.7 for the phone without the VPN, all
+bound by its Wi-Fi. The tun round trip there is about 2 ms (median `connect` through the
+tun 2.1 ms, straight to the LAN host 10 ms). A loopback benchmark of this stack with a 2 ms
+round trip moves 94 MB/s up (203 before this change) and 180 MB/s down on one connection
+at 128 KiB / 512 KiB; the window only binds above that.
+
+| File | Change |
+|---|---|
+| `proxy/tun/stack_gvisor.go` | `NewForwarder` takes `TCPReceiveBufferSizeRangeOption.Default` read back from the stack; the forwarder goroutine sets `TCPUserTimeoutOption(closedUnsentTimeout)` after `HandleConnection` returns. |
+| `proxy/tun/stack_gvisor_test.go` | **New.** A forwarded endpoint starts at the configured receive buffer; a closed connection whose reader stopped is reset. Both fail without the change. |
+
 ## Building geo matchers outside the protobuf config
 
 A geosite entry is tens of thousands of `Domain` messages and a country's geoip entry

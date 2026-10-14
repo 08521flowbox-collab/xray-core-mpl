@@ -50,6 +50,8 @@ type GVisorTun interface {
 
 const defaultMaxInFlightHandshakes = 256
 
+var closedUnsentTimeout = time.Minute
+
 // NewStack builds new ip stack (using gVisor)
 func NewStack(ctx context.Context, options StackOptions, handler *Handler) (Stack, error) {
 	gStack := &stackGVisor{
@@ -84,7 +86,11 @@ func (t *stackGVisor) Start() error {
 	if maxInFlightHandshakes != defaultMaxInFlightHandshakes {
 		errors.LogInfo(context.Background(), "tun: max in-flight handshakes ", maxInFlightHandshakes)
 	}
-	tcpForwarder := tcp.NewForwarder(ipStack, 0, maxInFlightHandshakes, func(r *tcp.ForwarderRequest) {
+	var rcvBuf tcpip.TCPReceiveBufferSizeRangeOption
+	if err := ipStack.TransportProtocolOption(tcp.ProtocolNumber, &rcvBuf); err != nil {
+		return errors.New(err.String())
+	}
+	tcpForwarder := tcp.NewForwarder(ipStack, rcvBuf.Default, maxInFlightHandshakes, func(r *tcp.ForwarderRequest) {
 		go func(r *tcp.ForwarderRequest) {
 			var wq waiter.Queue
 			var id = r.ID()
@@ -115,6 +121,8 @@ func (t *stackGVisor) Start() error {
 				net.TCPDestination(net.IPAddress(id.LocalAddress.AsSlice()), net.Port(id.LocalPort)),
 			)
 
+			unsent := tcpip.TCPUserTimeoutOption(closedUnsentTimeout)
+			ep.SetSockOpt(&unsent)
 			ep.Close()
 		}(r)
 	})
@@ -279,9 +287,9 @@ func createStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
 	gStack.SetTransportProtocolOption(tcp.ProtocolNumber, &rOpt)
 
 	// A host with a hard memory cap (the iOS packet tunnel's 50 MB) trades
-	// per-connection throughput for headroom here; everyone else keeps the
-	// defaults. Measured 2026-09-02: fast.com over the defaults took the
-	// extension to 40 MB and jetsam.
+	// per-connection throughput for headroom here; a host that sets neither
+	// flag keeps the defaults. Measured 2026-09-02: fast.com over the defaults
+	// took the extension to 40 MB and jetsam.
 	rxDef := platform.NewEnvFlag(platform.TunTCPBufDefaultKey).GetValueAsInt(tcpRXBufDefSize)
 	rxMax := platform.NewEnvFlag(platform.TunTCPBufMaxKey).GetValueAsInt(tcpRXBufMaxSize)
 	txDef := platform.NewEnvFlag(platform.TunTCPBufDefaultKey).GetValueAsInt(tcpTXBufDefSize)
