@@ -905,6 +905,27 @@ JSON, because the consumer builds its configuration as protobuf and never links 
 | `proxy/shadowsocks_2022/inbound_multi.go` | Drops the UDP session a packet that failed authentication created. |
 | `proxy/shadowsocks_2022/inbound_multi_udp_session_test.go` | **New.** Pins the fix above. |
 
+## Bounding the tun's live TCP connections
+
+The handshake bound stops counting a connection once its handshake completes, so nothing bounded
+how many forwarded TCP connections a tun stack held. On Android devices whose system apps keep
+hundreds of long-lived connections open, the count climbed into the thousands, with several
+goroutines and a receive buffer each, until the low-memory killer ended the VPN process.
+
+With `xray.tun.maxtcpconns` set, a new connection that finds the table full closes the one that
+has gone longest without data in either direction, as the UDP flow table does. The newcomer is
+never refused. Unset keeps the table unbounded. The stack also reports what it holds: open TCP
+connections and UDP flows, evictions, and the destinations holding the most TCP connections.
+
+| File | Change |
+|---|---|
+| `proxy/tun/tcp_table.go` | **New.** `tcpConn` wraps the forwarded `gonet.TCPConn` and stamps `lastActive` on every read and write; `tcpTable` adds, removes, evicts the quietest when full (cancelling its handler context and closing its endpoint) and counts by destination. `Census`/`Share` are the report. |
+| `proxy/tun/stack_gvisor.go` | The TCP forwarder registers each connection in the table and hands the handler a cancellable context; `census` reports both tables. `closedUnsentTimeout` is read once in `Start`, so a test changing it cannot race a forwarder goroutine of an earlier stack. |
+| `proxy/tun/handler.go` | `HandleConnection` delegates to `handleConnection(parent, ...)`; new `Census(top)`; `Start` publishes `stack`/`tun` under the close lock. |
+| `proxy/tun/udp_fullcone.go` | `census()` returns the flow count and evictions. |
+| `common/platform/platform.go` | `TunMaxTCPConnsKey = "xray.tun.maxtcpconns"`. |
+| `proxy/tun/tcp_table_test.go` | **New.** A full table closes the quietest connection rather than the oldest, an unset bound never evicts, the census ranks destinations and keeps a source, and an ended connection leaves the table. |
+
 ## Verifying the result
 
 ```sh

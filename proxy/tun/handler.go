@@ -134,11 +134,22 @@ func (t *Handler) Start() error {
 		return err
 	}
 
+	t.closeOnce.Lock()
 	t.stack = tunStack
 	t.tun = tunInterface
+	t.closeOnce.Unlock()
 
 	errors.LogInfo(t.ctx, tunName, " up")
 	return nil
+}
+
+func (t *Handler) Census(top int) Census {
+	t.closeOnce.Lock()
+	defer t.closeOnce.Unlock()
+	if s, ok := t.stack.(*stackGVisor); ok {
+		return s.census(top)
+	}
+	return Census{}
 }
 
 // Close implements common.Closable, and it is what lets the tun descriptor go.
@@ -184,11 +195,15 @@ func (t *Handler) Close() error {
 
 // HandleConnection pass the connection coming from the ip stack to the routing dispatcher
 func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
+	t.handleConnection(t.ctx, conn, destination)
+}
+
+func (t *Handler) handleConnection(parent context.Context, conn net.Conn, destination net.Destination) {
 	// when handling is done with any outcome, always signal back to the incoming connection
 	// to close, send completion packets back to the network, and cleanup
 	defer conn.Close()
 
-	ctx, cancel := context.WithCancel(t.ctx)
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	ctx = c.ContextWithID(ctx, session.NewID())
 

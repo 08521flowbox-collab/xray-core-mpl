@@ -34,6 +34,7 @@ const (
 	// fork defaults. See proxy/tun/stack_gvisor.go and udp_fullcone.go.
 	TunMaxHandshakesKey = "xray.tun.maxhandshakes"
 	TunMaxUDPFlowsKey   = "xray.tun.maxudpflows"
+	TunMaxTCPConnsKey   = "xray.tun.maxtcpconns"
 
 	MphCachePath = "xray.mph.cache"
 )

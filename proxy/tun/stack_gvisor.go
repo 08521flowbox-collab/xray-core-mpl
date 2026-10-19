@@ -41,6 +41,7 @@ type stackGVisor struct {
 	stack        *stack.Stack
 	endpoint     stack.LinkEndpoint
 	udpForwarder *udpConnectionHandler
+	tcp          *tcpTable
 }
 
 // GVisorTun implements a bridge to connect gVisor ip stack to tun interface
@@ -82,6 +83,7 @@ func (t *stackGVisor) Start() error {
 	// memory-capped process that bound is the only thing standing between a
 	// connection burst and the jetsam line. Hosts with more room raise it
 	// through platform.TunMaxHandshakesKey.
+	unsent := tcpip.TCPUserTimeoutOption(closedUnsentTimeout)
 	maxInFlightHandshakes := platform.NewEnvFlag(platform.TunMaxHandshakesKey).GetValueAsInt(defaultMaxInFlightHandshakes)
 	if maxInFlightHandshakes != defaultMaxInFlightHandshakes {
 		errors.LogInfo(context.Background(), "tun: max in-flight handshakes ", maxInFlightHandshakes)
@@ -90,6 +92,11 @@ func (t *stackGVisor) Start() error {
 	if err := ipStack.TransportProtocolOption(tcp.ProtocolNumber, &rcvBuf); err != nil {
 		return errors.New(err.String())
 	}
+	maxTCPConns := platform.NewEnvFlag(platform.TunMaxTCPConnsKey).GetValueAsInt(0)
+	if maxTCPConns > 0 {
+		errors.LogInfo(context.Background(), "tun: max tcp connections ", maxTCPConns)
+	}
+	t.tcp = newTCPTable(maxTCPConns)
 	tcpForwarder := tcp.NewForwarder(ipStack, rcvBuf.Default, maxInFlightHandshakes, func(r *tcp.ForwarderRequest) {
 		go func(r *tcp.ForwarderRequest) {
 			var wq waiter.Queue
@@ -115,13 +122,18 @@ func (t *stackGVisor) Start() error {
 			options.SetReuseAddress(true)
 			options.SetReusePort(true)
 
-			t.handler.HandleConnection(
-				gonet.NewTCPConn(&wq, ep),
-				// local address on the gVisor side is connection destination
-				net.TCPDestination(net.IPAddress(id.LocalAddress.AsSlice()), net.Port(id.LocalPort)),
-			)
+			ctx, cancel := context.WithCancel(t.ctx)
+			conn := &tcpConn{
+				TCPConn: gonet.NewTCPConn(&wq, ep),
+				src:     net.TCPDestination(net.IPAddress(id.RemoteAddress.AsSlice()), net.Port(id.RemotePort)),
+				dst:     net.TCPDestination(net.IPAddress(id.LocalAddress.AsSlice()), net.Port(id.LocalPort)),
+				cancel:  cancel,
+			}
+			t.tcp.add(conn)
+			t.handler.handleConnection(ctx, conn, conn.dst)
+			t.tcp.remove(conn)
+			cancel()
 
-			unsent := tcpip.TCPUserTimeoutOption(closedUnsentTimeout)
 			ep.SetSockOpt(&unsent)
 			ep.Close()
 		}(r)
@@ -222,6 +234,16 @@ func (t *stackGVisor) writeRawUDPPacket(payload []byte, src net.Destination, dst
 	}
 
 	return nil
+}
+
+func (t *stackGVisor) census(top int) Census {
+	var c Census
+	c.TCP, c.Top = t.tcp.census(top)
+	c.TCPEvicted = t.tcp.evictions.Load()
+	if t.udpForwarder != nil {
+		c.UDP, c.UDPEvicted = t.udpForwarder.census()
+	}
+	return c
 }
 
 // Close is called by Handler to shut down the stack

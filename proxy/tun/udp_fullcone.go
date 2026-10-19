@@ -147,6 +147,12 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	}
 }
 
+func (u *udpConnectionHandler) census() (int, uint64) {
+	u.RLock()
+	defer u.RUnlock()
+	return len(u.udpConns), u.evictions.Load()
+}
+
 func (u *udpConnectionHandler) dropFlow(counter *atomic.Uint64, why string, src, dst net.Destination) {
 	n := counter.Add(1)
 	if n == 1 || n%1000 == 0 {

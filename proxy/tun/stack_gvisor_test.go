@@ -66,7 +66,7 @@ func relay(ctx context.Context, from, to *channel.Endpoint) {
 	}
 }
 
-func startTestStack(t *testing.T, d *answeringDispatcher) (*stackGVisor, *stack.Stack) {
+func startTestStack(t *testing.T, d routing.Dispatcher) (*stackGVisor, *stack.Stack) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	tunEP := channel.New(512, 1500, "")
