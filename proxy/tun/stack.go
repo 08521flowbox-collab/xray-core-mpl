@@ -13,5 +13,6 @@ type Stack interface {
 // StackOptions for the stack implementation
 type StackOptions struct {
 	Tun         Tun
+	MTU         uint32
 	IdleTimeout time.Duration
 }

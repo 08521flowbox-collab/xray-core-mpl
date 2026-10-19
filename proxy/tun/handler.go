@@ -112,6 +112,7 @@ func (t *Handler) Start() error {
 
 	tunStackOptions := StackOptions{
 		Tun:         tunInterface,
+		MTU:         t.config.MTU,
 		IdleTimeout: t.policyManager.ForLevel(t.config.UserLevel).Timeouts.ConnectionIdle,
 	}
 	tunStack, err := NewStack(t.ctx, tunStackOptions, t)
@@ -146,7 +147,7 @@ func (t *Handler) Start() error {
 func (t *Handler) Census(top int) Census {
 	t.closeOnce.Lock()
 	defer t.closeOnce.Unlock()
-	if s, ok := t.stack.(*stackGVisor); ok {
+	if s, ok := t.stack.(interface{ census(int) Census }); ok {
 		return s.census(top)
 	}
 	return Census{}

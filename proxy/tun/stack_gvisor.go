@@ -1,3 +1,5 @@
+//go:build !android
+
 package tun
 
 import (
@@ -10,7 +12,7 @@ import (
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
-	"gvisor.dev/gvisor/pkg/tcpip/checksum"
+	gchecksum "gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
@@ -123,15 +125,16 @@ func (t *stackGVisor) Start() error {
 			options.SetReusePort(true)
 
 			ctx, cancel := context.WithCancel(t.ctx)
-			conn := &tcpConn{
-				TCPConn: gonet.NewTCPConn(&wq, ep),
-				src:     net.TCPDestination(net.IPAddress(id.RemoteAddress.AsSlice()), net.Port(id.RemotePort)),
-				dst:     net.TCPDestination(net.IPAddress(id.LocalAddress.AsSlice()), net.Port(id.LocalPort)),
-				cancel:  cancel,
+			conn := gonet.NewTCPConn(&wq, ep)
+			e := &tcpEntry{
+				src:    net.TCPDestination(net.IPAddress(id.RemoteAddress.AsSlice()), net.Port(id.RemotePort)),
+				dst:    net.TCPDestination(net.IPAddress(id.LocalAddress.AsSlice()), net.Port(id.LocalPort)),
+				cancel: cancel,
+				close:  conn.Close,
 			}
-			t.tcp.add(conn)
-			t.handler.handleConnection(ctx, conn, conn.dst)
-			t.tcp.remove(conn)
+			t.tcp.add(e)
+			t.handler.handleConnection(ctx, &gvisorConn{TCPConn: conn, entry: e}, e.dst)
+			t.tcp.remove(e)
 			cancel()
 
 			ep.SetSockOpt(&unsent)
@@ -203,7 +206,7 @@ func (t *stackGVisor) writeRawUDPPacket(payload []byte, src net.Destination, dst
 
 	// Calculate and set UDP checksum
 	xsum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, srcIP, dstIP, uint16(udpLen))
-	udpHdr.SetChecksum(^udpHdr.CalculateChecksum(checksum.Checksum(payload, xsum)))
+	udpHdr.SetChecksum(^udpHdr.CalculateChecksum(gchecksum.Checksum(payload, xsum)))
 
 	// Build IP header
 	if isIPv4 {
@@ -341,4 +344,26 @@ func createStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
 	}
 
 	return gStack, nil
+}
+
+// gvisorConn is a connection of the table: what is read from it and written to it keeps it from being the quietest
+type gvisorConn struct {
+	*gonet.TCPConn
+	entry *tcpEntry
+}
+
+func (c *gvisorConn) Read(b []byte) (int, error) {
+	n, err := c.TCPConn.Read(b)
+	if n > 0 {
+		c.entry.touch()
+	}
+	return n, err
+}
+
+func (c *gvisorConn) Write(b []byte) (int, error) {
+	n, err := c.TCPConn.Write(b)
+	if n > 0 {
+		c.entry.touch()
+	}
+	return n, err
 }

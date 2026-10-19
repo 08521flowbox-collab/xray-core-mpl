@@ -9,8 +9,6 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/platform"
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 type AndroidTun struct {
@@ -20,9 +18,6 @@ type AndroidTun struct {
 
 // DefaultTun implements Tun
 var _ Tun = (*AndroidTun)(nil)
-
-// DefaultTun implements GVisorTun
-var _ GVisorTun = (*AndroidTun)(nil)
 
 // NewTun builds new tun interface handler.
 //
@@ -61,10 +56,20 @@ func (t *AndroidTun) Close() error {
 	return nil
 }
 
-func (t *AndroidTun) newEndpoint() (stack.LinkEndpoint, error) {
-	return fdbased.New(&fdbased.Options{
-		FDs:               []int{t.tunFd},
-		MTU:               t.options.MTU,
-		RXChecksumOffload: true,
-	})
+// packets reads and writes the tun through a duplicate of the descriptor, the stack's own to close: closing it
+// ends the reading and leaves the caller's descriptor alone
+func (t *AndroidTun) packets() (packetTun, error) {
+	fd, err := unix.FcntlInt(uintptr(t.tunFd), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	return fdPackets{newFdTun(fd, 0)}, nil
+}
+
+type fdPackets struct {
+	*fdTun
+}
+
+func (p fdPackets) Close() error {
+	return p.closeFile()
 }

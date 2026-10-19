@@ -919,12 +919,50 @@ connections and UDP flows, evictions, and the destinations holding the most TCP 
 
 | File | Change |
 |---|---|
-| `proxy/tun/tcp_table.go` | **New.** `tcpConn` wraps the forwarded `gonet.TCPConn` and stamps `lastActive` on every read and write; `tcpTable` adds, removes, evicts the quietest when full (cancelling its handler context and closing its endpoint) and counts by destination. `Census`/`Share` are the report. |
+| `proxy/tun/tcp_table.go` | **New.** `tcpEntry` is a forwarded connection's endpoints, cancel and close, with `lastActive` stamped on every read and write; `tcpTable` adds, removes, evicts the quietest when full (cancelling its handler context and closing its endpoint) and counts by destination. `Census`/`Share` are the report. |
 | `proxy/tun/stack_gvisor.go` | The TCP forwarder registers each connection in the table and hands the handler a cancellable context; `census` reports both tables. `closedUnsentTimeout` is read once in `Start`, so a test changing it cannot race a forwarder goroutine of an earlier stack. |
 | `proxy/tun/handler.go` | `HandleConnection` delegates to `handleConnection(parent, ...)`; new `Census(top)`; `Start` publishes `stack`/`tun` under the close lock. |
 | `proxy/tun/udp_fullcone.go` | `census()` returns the flow count and evictions. |
 | `common/platform/platform.go` | `TunMaxTCPConnsKey = "xray.tun.maxtcpconns"`. |
 | `proxy/tun/tcp_table_test.go` | **New.** A full table closes the quietest connection rather than the oldest, an unset bound never evicts, the census ranks destinations and keeps a source, and an ended connection leaves the table. |
+
+## Replacing gVisor with upstream's built-in TCP/IP stack on Android
+
+Upstream replaced gVisor in `proxy/tun` with a TCP/IP stack of its own in v26.10.17 (`92ccc939`).
+On Android this fork takes that stack and no longer links gVisor. Every other platform keeps
+gVisor, since the Windows consumer builds the same tree, so the gVisor sections above (in-flight
+handshakes, the TCP buffer flags, sizing forwarded connections) now apply off Android only.
+
+Measured on a vivo 1906 (Android 11) against the gVisor build of the same tree, through the tun
+to a host on the LAN: a downloaded MB costs about 80 ms of CPU instead of 117–131, an uploaded MB
+about 24 instead of 60–70; with 1024 connections held, the Go heap peaks at 24 MB instead of 39
+and the Go runtime's memory at 59 MB instead of 72. `libgojni.so` is 18.5 MB instead of 22.4 on
+arm64-v8a and 18.4 instead of 21.9 on armeabi-v7a.
+
+The stack holds at most 256 KiB per connection each way: what the system sent and the handler has
+not read is bounded by the window the stack advertises, what was written and not yet acknowledged
+by the same amount, and `Write` waits beyond it. There is nothing to size, so the gVisor flags
+(`xray.tun.tcpbuf.*`, `xray.tun.maxhandshakes`) do nothing on Android.
+
+The stack is upstream's, fitted to this tree's handler rather than upstream's newer one:
+
+| File | Change |
+|---|---|
+| `proxy/tun/packet.go` | **New**, from upstream. `writeFragments` takes the `packetTun` below instead of upstream's `Tun`. |
+| `proxy/tun/tcp_lightweight.go` | **New**, from upstream. Its receiver is `lightStack` (upstream's `stack`). |
+| `proxy/tun/tun_fd.go` | **New**, from upstream, built for `android` instead of `linux`. |
+| `proxy/tun/stack_lightweight.go` | **New**: upstream's `stack.go` as `lightStack`. It reads and writes a `packetTun`; new TCP connections go through the `tcpTable` of "Bounding the tun's live TCP connections", UDP through this tree's `udpConnectionHandler` with its idle timeout and DNS hijack. Upstream's UDP sockets (`DialUDP`) and its options for a tun that is a tunnel to another system (`Addresses`, `Remote`) are left out. |
+| `proxy/tun/stack_android.go` | **New.** `NewStack` for Android builds `lightStack` on the tun's descriptor. |
+| `proxy/tun/tun_android.go` | `AndroidTun` no longer builds a gVisor link endpoint. `packets()` hands the stack a duplicate of the descriptor, the stack's own to close, so closing the stack ends its read and leaves the caller's descriptor alone. |
+| `proxy/tun/stack.go` | `StackOptions.MTU`. |
+| `proxy/tun/handler.go` | Passes the MTU to the stack; the census comes from whichever stack has one. |
+| `proxy/tun/tcp_table.go` | The table holds a `tcpEntry` instead of wrapping `gonet.TCPConn`, so both stacks share it. |
+| `proxy/tun/stack_gvisor.go`, `proxy/tun/stack_gvisor_endpoint.go` | `//go:build !android`. The forwarder registers a `tcpEntry` and hands the handler a `gvisorConn` that stamps it. gVisor's `checksum` package is imported as `gchecksum`, since `packet.go` has a `checksum` of its own. |
+| `proxy/tun/udp_fullcone.go` | The queued datagram type is `datagram`, no longer `packet`, a name `packet.go` now takes. |
+| `proxy/tun/stack_lightweight_test.go` | **New**: upstream's `stack_test.go`, fitted to `lightStack`. |
+| `proxy/tun/stack_lightweight_table_test.go` | **New.** The connection bound, the census and the table cleanup against `lightStack`. |
+| `proxy/tun/tun_android_test.go` | **New**, `android` only. Closing the stack releases its own descriptor and not the caller's. |
+| `proxy/tun/stack_gvisor_test.go`, `proxy/tun/tcp_table_test.go` | `//go:build !android`. |
 
 ## Verifying the result
 

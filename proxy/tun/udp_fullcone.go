@@ -35,7 +35,7 @@ var portIdle = map[net.Port]time.Duration{
 // sing's NAT uses 64; the 1024 upstream chose is 8 KiB of pointers per flow.
 const egressQueue = 64
 
-type packet struct {
+type datagram struct {
 	data []byte
 	dest *net.Destination
 }
@@ -100,7 +100,7 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	if found {
 		conn.lastActive.Store(time.Now().UnixNano())
 		select {
-		case conn.egress <- &packet{
+		case conn.egress <- &datagram{
 			data: data,
 			dest: &dst,
 		}:
@@ -128,7 +128,7 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 		if len(u.udpConns) >= u.maxFlows {
 			u.evictOldestLocked(src, dst)
 		}
-		egress := make(chan *packet, egressQueue)
+		egress := make(chan *datagram, egressQueue)
 		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst}
 		u.udpConns[src] = conn
 
@@ -138,7 +138,7 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 
 	// send packet data to the egress channel, if it has buffer, or discard
 	select {
-	case conn.egress <- &packet{
+	case conn.egress <- &datagram{
 		data: data,
 		dest: &dst,
 	}:
@@ -277,7 +277,7 @@ func (u *udpConnectionHandler) evict(stale func(*udpConn) bool) {
 type udpConn struct {
 	handler *udpConnectionHandler
 
-	egress     chan *packet
+	egress     chan *datagram
 	src        net.Destination
 	dst        net.Destination
 	lastActive atomic.Int64
