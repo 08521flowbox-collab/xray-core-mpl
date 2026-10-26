@@ -1,6 +1,7 @@
 package bittorrent
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 
@@ -77,5 +78,45 @@ func SniffUTP(b []byte) (*SniffHeader, error) {
 		return nil, errNotBittorrent
 	}
 
+	return &SniffHeader{}, nil
+}
+
+// udpTrackerProtocolID is the magic constant opening every BEP 15 connect request.
+const udpTrackerProtocolID = 0x41727101980
+
+// SniffUDPTracker matches the BEP 15 connect request, the first packet of every
+// UDP tracker exchange.
+func SniffUDPTracker(b []byte) (*SniffHeader, error) {
+	if len(b) != 16 || binary.BigEndian.Uint64(b[:8]) != udpTrackerProtocolID || binary.BigEndian.Uint32(b[8:12]) != 0 {
+		return nil, errNotBittorrent
+	}
+	return &SniffHeader{}, nil
+}
+
+// SniffDHT matches a BEP 5 KRPC message: a bencoded dictionary carrying a
+// message type key and the sender's 20-byte node id.
+func SniffDHT(b []byte) (*SniffHeader, error) {
+	if len(b) < 2 || b[0] != 'd' || b[len(b)-1] != 'e' {
+		return nil, errNotBittorrent
+	}
+	if !bytes.Contains(b, []byte("1:y1:")) || !bytes.Contains(b, []byte("2:id20:")) {
+		return nil, errNotBittorrent
+	}
+	return &SniffHeader{}, nil
+}
+
+// SniffHTTPAnnounce matches a BEP 3 HTTP tracker announce or scrape. It has to
+// run before the HTTP sniffer, which would otherwise claim the request.
+func SniffHTTPAnnounce(b []byte) (*SniffHeader, error) {
+	if len(b) < 4 {
+		return nil, common.ErrNoClue
+	}
+	if !bytes.HasPrefix(b, []byte("GET ")) {
+		return nil, errNotBittorrent
+	}
+	line, _, _ := bytes.Cut(b, []byte("\r\n"))
+	if !bytes.Contains(line, []byte("info_hash=")) {
+		return nil, errNotBittorrent
+	}
 	return &SniffHeader{}, nil
 }
