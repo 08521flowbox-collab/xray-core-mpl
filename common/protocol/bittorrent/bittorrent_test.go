@@ -65,3 +65,77 @@ func TestSniffUTP(t *testing.T) {
 		})
 	}
 }
+
+func TestSniffUDPTracker(t *testing.T) {
+	connect := make([]byte, 16)
+	binary.BigEndian.PutUint64(connect[:8], udpTrackerProtocolID)
+	binary.BigEndian.PutUint32(connect[12:], 0x5a1f03c7)
+	announce := append([]byte{}, connect...)
+	binary.BigEndian.PutUint32(announce[8:12], 1)
+
+	cases := []struct {
+		name    string
+		payload []byte
+		err     error
+	}{
+		{"connect", connect, nil},
+		{"announce action", announce, errNotBittorrent},
+		{"wrong magic", make([]byte, 16), errNotBittorrent},
+		{"trailing bytes", append(append([]byte{}, connect...), 0), errNotBittorrent},
+		{"truncated", connect[:12], errNotBittorrent},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := SniffUDPTracker(c.payload); err != c.err {
+				t.Fatalf("expected error %v, got %v", c.err, err)
+			}
+		})
+	}
+}
+
+func TestSniffDHT(t *testing.T) {
+	id := "abcdefghij0123456789"
+	cases := []struct {
+		name    string
+		payload string
+		err     error
+	}{
+		{"ping query", "d1:ad2:id20:" + id + "e1:q4:ping1:t2:aa1:y1:qe", nil},
+		{"get_peers query", "d1:ad2:id20:" + id + "9:info_hash20:" + id + "e1:q9:get_peers1:t2:aa1:v4:UT\x01\x011:y1:qe", nil},
+		{"response with BEP 42 ip", "d2:ip6:\x01\x02\x03\x04\x1a\xe11:rd2:id20:" + id + "e1:t2:aa1:y1:re", nil},
+		{"bencoded without node id", "d1:y1:q1:t2:aae", errNotBittorrent},
+		{"node id outside a dictionary", "x1:y1:q2:id20:" + id + "e", errNotBittorrent},
+		{"unterminated", "d1:ad2:id20:" + id + "e1:q4:ping1:t2:aa1:y1:q", errNotBittorrent},
+		{"empty", "", errNotBittorrent},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := SniffDHT([]byte(c.payload)); err != c.err {
+				t.Fatalf("expected error %v, got %v", c.err, err)
+			}
+		})
+	}
+}
+
+func TestSniffHTTPAnnounce(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		err     error
+	}{
+		{"announce", "GET /announce?info_hash=%8da%ab&peer_id=-qB4650-&port=13466 HTTP/1.1\r\nHost: tracker.example\r\n\r\n", nil},
+		{"private tracker passkey path", "GET /a1b2c3/announce.php?info_hash=%8da%ab HTTP/1.1\r\n\r\n", nil},
+		{"scrape", "GET /scrape?info_hash=%8da%ab HTTP/1.0\r\n\r\n", nil},
+		{"ordinary get", "GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n", errNotBittorrent},
+		{"info_hash only in a header", "GET / HTTP/1.1\r\nReferer: /?info_hash=x\r\n\r\n", errNotBittorrent},
+		{"post", "POST /announce?info_hash=x HTTP/1.1\r\n\r\n", errNotBittorrent},
+		{"too short", "GE", common.ErrNoClue},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := SniffHTTPAnnounce([]byte(c.payload)); err != c.err {
+				t.Fatalf("expected error %v, got %v", c.err, err)
+			}
+		})
+	}
+}
