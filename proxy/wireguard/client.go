@@ -267,6 +267,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		c := &UDPConnClient{
 			PacketConn: conn.(*net.PacketConnWrapper).PacketConn,
 			Dest:       conn.RemoteAddr().(*net.UDPAddr),
+			Target:     ob.Target.Address,
 		}
 		reader = c
 		writer = c
@@ -370,7 +371,8 @@ func MakeResolveLocal(d dns.Client, streamSettings *internet.MemoryStreamConfig)
 
 type UDPConnClient struct {
 	net.PacketConn
-	Dest *net.UDPAddr
+	Dest   *net.UDPAddr
+	Target net.Address
 }
 
 func (c *UDPConnClient) ReadMultiBuffer() (buf.MultiBuffer, error) {
@@ -383,9 +385,14 @@ func (c *UDPConnClient) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	}
 	b.Resize(0, int32(n))
 
+	source := addr.(*net.UDPAddr)
+	address := net.IPAddress(source.IP)
+	if source.IP.Equal(c.Dest.IP) {
+		address = c.Target
+	}
 	b.UDP = &net.Destination{
-		Address: net.IPAddress(addr.(*net.UDPAddr).IP),
-		Port:    net.Port(addr.(*net.UDPAddr).Port),
+		Address: address,
+		Port:    net.Port(source.Port),
 		Network: net.Network_UDP,
 	}
 
