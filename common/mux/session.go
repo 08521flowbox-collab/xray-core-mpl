@@ -13,7 +13,6 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/signal/done"
-	"github.com/xtls/xray-core/transport/pipe"
 )
 
 type SessionManager struct {
@@ -155,6 +154,12 @@ func (m *SessionManager) Close() error {
 	return nil
 }
 
+type recoverableReader interface {
+	buf.Reader
+	ReturnAnError(error)
+	Recover() error
+}
+
 // Session represents a client connection in a Mux connection.
 type Session struct {
 	input        buf.Reader
@@ -187,10 +192,11 @@ func (s *Session) Close(locked bool) error {
 	} else {
 		// Stop existing handle(), then trigger writer.Close().
 		// Note that s.output may be dispatcher.SizeStatWriter.
-		s.input.(*pipe.Reader).ReturnAnError(io.EOF)
+		input := s.input.(recoverableReader)
+		input.ReturnAnError(io.EOF)
 		runtime.Gosched()
 		// If the error set by ReturnAnError still exists, clear it.
-		s.input.(*pipe.Reader).Recover()
+		input.Recover()
 		XUDPManager.Lock()
 		if s.XUDP.Status == Active {
 			s.XUDP.Expire = time.Now().Add(time.Minute)
